@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es-AR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Análisis Inmobiliario AR</title>
+    <link rel="stylesheet" href="/styles.css?v=2" />
+  </head>
+  <body>
+    <header>
+      <h1>Análisis Inmobiliario AR</h1>
+      <div id="fx" class="fx"><span id="fx-label">Dólar</span>: <span id="fx-value">cargando…</span></div>
+    </header>
+
+    <main>
+      <section id="recent-analyses" class="hidden">
+        <h2>Análisis recientes</h2>
+        <div id="recent-analyses-list"></div>
+      </section>
+
+      <section class="form-card">
+        <label>Barrios
+          <div class="autocomplete-wrap">
+            <input id="neighborhoods-input" type="text" placeholder="Escribí un barrio (ej: palermo, núñez, vicente lópez)" autocomplete="off" spellcheck="false" />
+            <ul id="neighborhoods-suggestions" class="suggestions" role="listbox" hidden></ul>
+          </div>
+          <div id="selected-neighborhoods" class="chips"></div>
+        </label>
+
+        <div class="row">
+          <label><input type="checkbox" id="include-pozo" /> Incluir en pozo</label>
+          <label><input type="checkbox" id="include-construccion" /> Incluir en construcción</label>
+          <label><input type="checkbox" id="force" /> Forzar re-scrape</label>
+        </div>
+
+        <div class="row">
+          <label>Min yield alquiler (%)
+            <input id="min-yield" type="number" value="5" min="0" max="100" step="0.5" />
+          </label>
+          <label>Min build yield (%)
+            <input id="min-build-yield" type="number" value="5" min="0" max="100" step="0.5" />
+          </label>
+          <label>Min ambientes
+            <input id="min-rooms" type="number" value="" min="1" max="10" placeholder="cualquiera" />
+          </label>
+          <label>Max ambientes
+            <input id="max-rooms" type="number" value="" min="1" max="10" placeholder="cualquiera" />
+          </label>
+        </div>
+
+        <div class="row">
+          <label><input type="checkbox" id="require-pool" /> Requiere pileta</label>
+          <label><input type="checkbox" id="require-garage" /> Requiere cochera</label>
+        </div>
+
+        <div class="actions">
+          <button id="analyze">Analizar</button>
+          <button id="refresh-analysis" class="secondary hidden" title="Re-scrapear los barrios de este análisis">Actualizar datos</button>
+          <button id="new-analysis" class="secondary hidden" title="Limpiar y empezar un análisis nuevo">Nuevo análisis</button>
+        </div>
+        <div id="analysis-current" class="analysis-current hidden"></div>
+      </section>
+
+      <section id="job-status" class="hidden">
+        <h2>Estado del job</h2>
+        <div id="job-progress"></div>
+      </section>
+
+      <section id="sources-section" class="hidden">
+        <h2>Estado por fuente</h2>
+        <div id="sources-container"></div>
+      </section>
+
+      <section id="stats-section" class="hidden">
+        <h2>Estadísticas por barrio</h2>
+        <div id="stats-container"></div>
+      </section>
+
+      <section id="ranking-section" class="hidden">
+        <h2>Ranking de propiedades</h2>
+        <div id="ranking-toolbar" class="ranking-toolbar"></div>
+        <div id="ranking-container"></div>
+      </section>
+    </main>
+
+    <script src="/app.js?v=2"></script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: real-state-analyzer
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      # Mount the host's Claude credentials so the agent-based scrapers can
+      # spawn `claude` without re-authenticating. Run `claude login` on the
+      # host once before the first build. The mount is read-write because
+      # `claude` writes per-session state into ~/.claude; the container can
+      # only see/modify files inside this directory, never the rest of $HOME.
+      - ${HOME}/.claude:/home/pwuser/.claude
+      # Claude CLI also stores per-machine state in ~/.claude.json (sibling of
+      # the directory above). Mount it too when it exists on the host.
+      - ${HOME}/.claude.json:/home/pwuser/.claude.json
+    environment:
+      PORT: "3000"
+      CACHE_TTL_HOURS: "${CACHE_TTL_HOURS:-24}"
+      MAX_CONCURRENCY: "${MAX_CONCURRENCY:-2}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      INCREMENTAL_STOP_AFTER: "${INCREMENTAL_STOP_AFTER:-30}"
+      FULL_REFRESH_DAYS: "${FULL_REFRESH_DAYS:-7}"
+      # Optional: set via .env when ~/.claude is not usable (e.g. macOS host
+      # where credentials live in the Keychain). Generate with `claude setup-token`.
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      AGENT_MODEL: "${AGENT_MODEL:-}"
+      # USD rate type used to convert ARS to USD. One of: oficial, blue, bolsa,
+      # contadoconliqui, mayorista, cripto, tarjeta. Default oficial.
+      FX_RATE_TYPE: "${FX_RATE_TYPE:-oficial}"
+    restart: unless-stopped
