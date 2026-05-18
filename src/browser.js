@@ -28,15 +28,20 @@ async function getPersistentContext() {
   // second loses with "File exists (17)" and the scrape errors out.
   if (launching) return launching;
   launching = (async () => {
-    // Wipe the scraper profile on each cold start. We have nothing worth
-    // preserving here — cookies are re-injected from data/ml-cookies.txt at
-    // launch, and a fresh profile prevents Chrome from popping a "Something
-    // went wrong" recovery dialog after a previous run was killed (Ctrl+C,
-    // crash) leaving session files in a half-written state. The dir is
-    // recreated by mkdir below.
+    // Persistent profile across runs. We used to wipe it on each cold start
+    // (clean slate, no recovery dialogs) but that made ML's bot detector
+    // serve us a self-redirecting challenge page — same URL navigating to
+    // itself every ~1s in an infinite loop, so domcontentloaded never fired
+    // and every detail-page goto timed out. Letting Chrome accumulate
+    // IndexedDB / Local Storage / Cookies that ML sets in response to our
+    // legitimate cookies makes the profile look like a returning user.
+    // Only the SingletonLock files are cleaned (they cause "File exists"
+    // launch errors after an unclean shutdown).
     const profile = profileDir();
-    try { rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
     mkdirSync(profile, { recursive: true });
+    for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try { rmSync(path.join(profile, f), { force: true }); } catch { /* ignore */ }
+    }
     logger.info({ profile }, 'launching real Chrome (channel=chrome, headed off-screen)');
   persistentCtx = await chromium.launchPersistentContext(profileDir(), {
     channel: 'chrome',
@@ -59,19 +64,35 @@ async function getPersistentContext() {
     timezoneId: 'America/Argentina/Buenos_Aires',
     viewport: { width: 1366, height: 850 },
   });
-  // Block font network requests + ML's font-fingerprinting trackers. ML's
-  // `snoopy-search.js` (and a sibling anti-fraud bundle) probe the system for
-  // installed fonts as a bot-detection signal — iterating through Osaka,
-  // STHeiti, Hiragino, MS Gothic, etc. Each probe triggers macOS Font Book to
-  // pop a download dialog at the user. The script is pure tracking; aborting
-  // it leaves the listing page fully functional but ends the popups.
+  // Three categories of request manipulation:
+  //
+  // 1) FONTS_RE: ML's anti-fraud scripts (snoopy-search.js, datadome) probe
+  //    the system for installed fonts by trying to load Osaka, STHeiti,
+  //    Hiragino, etc. — each missing font triggers macOS Font Book to pop
+  //    a "Download Osaka" dialog. Originally we route.abort()'d these, but
+  //    ML's frontend detects the abort and traps us in an infinite self-
+  //    redirect loop. Instead we route.fulfill() with an empty 200 body so
+  //    the script "loads" successfully but the probe code never executes.
+  //
+  // 2) Font network requests (type === 'font') — same deal, just the actual
+  //    font binary fetches that follow the snoopy probe.
+  //
+  // 3) TRACKER_RE: pure third-party telemetry. Aborting these is fine; ML
+  //    doesn't care if Google Analytics fails to load.
+  const FONTPROBE_RE = /\/(snoopy|datadome|hcaptcha|recaptcha|fonts\.googleapis\.com|fonts\.gstatic\.com)/i;
   const TRACKER_RE =
-    /\/(snoopy|datadome|hcaptcha|recaptcha)|fonts\.googleapis\.com|connect\.facebook\.net|google-analytics\.com|googletagmanager\.com|hotjar\.com|doubleclick\.net|googlesyndication\.com|adsystem\.com|criteo\.com|taboola\.com|outbrain\.com|amplitude\.com|segment\.(?:com|io)|mixpanel\.com|fullstory\.com|newrelic\.com|nr-data\.net|bugsnag\.com|sentry\.io|clarity\.ms/i;
+    /connect\.facebook\.net|google-analytics\.com|googletagmanager\.com|hotjar\.com|doubleclick\.net|googlesyndication\.com|adsystem\.com|criteo\.com|taboola\.com|outbrain\.com|amplitude\.com|segment\.(?:com|io)|mixpanel\.com|fullstory\.com|newrelic\.com|nr-data\.net|bugsnag\.com|sentry\.io|clarity\.ms/i;
   await persistentCtx.route('**', async (route) => {
     const req = route.request();
+    const url = req.url();
     const type = req.resourceType();
-    if (type === 'font') return route.abort();
-    if (TRACKER_RE.test(req.url())) return route.abort();
+    if (type === 'font') {
+      return route.fulfill({ status: 200, contentType: 'font/woff2', body: '' });
+    }
+    if (FONTPROBE_RE.test(url)) {
+      return route.fulfill({ status: 200, contentType: 'application/javascript', body: '/* stubbed */' });
+    }
+    if (TRACKER_RE.test(url)) return route.abort();
     return route.continue();
   });
   // Belt-and-braces: override font-family for every element via a high-

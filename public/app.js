@@ -366,6 +366,16 @@ $('#new-analysis')?.addEventListener('click', () => {
   $('#ranking-section').classList.add('hidden');
   $('#sources-section').classList.add('hidden');
   $('#job-status').classList.add('hidden');
+  const enrichBar = document.getElementById('enrich-status');
+  if (enrichBar) {
+    enrichBar.classList.add('hidden');
+    enrichBar.innerHTML = '';
+  }
+  if (state.enrichPollHandle) clearTimeout(state.enrichPollHandle);
+  state.enrichPollHandle = null;
+  if (state.enrichFreshHandle) clearInterval(state.enrichFreshHandle);
+  state.enrichFreshHandle = null;
+  state.lastEnrichPending = 0;
   loadRecentAnalyses();
 });
 
@@ -609,6 +619,154 @@ function renderJobProgress(job) {
 async function loadResults() {
   const aid = state.analysis?.id;
   await Promise.all([renderStats(aid), loadRanking(aid), loadSources(aid)]);
+  // Kick off the background-enrich poller. It self-stops once pending hits 0.
+  pollEnrichStatus();
+}
+
+// While the scrape job is already "completed", the enrichment phase keeps
+// running in the background to pull detail-page fields (m², age, address).
+// This poller surfaces a banner with the pending count and auto-refreshes
+// the results once enrichment drains.
+async function pollEnrichStatus() {
+  if (state.enrichPollHandle) clearTimeout(state.enrichPollHandle);
+  const q = state.neighborhoods.join(',');
+  if (!q) return;
+  let data;
+  try {
+    const r = await fetch('/api/stats/enrich-status?neighborhoods=' + encodeURIComponent(q));
+    if (!r.ok) return;
+    data = await r.json();
+  } catch {
+    return;
+  }
+  const bar = document.getElementById('enrich-status');
+  if (!bar) return;
+  // Banner stays visible while EITHER enrichment or geocoding has pending
+  // work. Hiding it only on `pending<=0` would dismiss the bar while the
+  // geocoder is still processing thousands of addresses in the background.
+  const stillEnriching = (data.pending || 0) > 0;
+  const stillGeocoding = (data.pending_geocode || 0) > 0;
+  if (!stillEnriching && !stillGeocoding) {
+    bar.classList.add('hidden');
+    bar.innerHTML = '';
+    // One last refresh so freshly-enriched fields show up.
+    if (state.lastEnrichPending > 0 || state.lastPendingGeocode > 0) {
+      const aid = state.analysis?.id;
+      await Promise.all([renderStats(aid), loadRanking(aid)]);
+    }
+    state.lastEnrichPending = 0;
+    state.lastPendingGeocode = 0;
+    return;
+  }
+  const enriched = Math.max(0, (data.total || 0) - (data.pending || 0));
+  const pct = data.total ? Math.round((enriched / data.total) * 100) : 0;
+  const geoAvailable = typeof data.pending_geocode === 'number';
+  const failedGeo = Number(data.failed_geocode) || 0;
+  const geoLine = data.pending_geocode > 0
+    ? ` · ${data.pending_geocode} pendientes de geocoding`
+    : '';
+  const failedLine = failedGeo > 0 ? ` · ${failedGeo} fallidos` : '';
+  // When enrichment is done but geocoding is still running, switch the
+  // headline so it doesn't say "100%" forever — the user wants to see that
+  // there's still work happening.
+  const headline = stillEnriching
+    ? `Enriqueciendo en background: <b>${enriched}/${data.total}</b> (${pct}%)${geoLine}${failedLine}`
+    : (data.pending_geocode > 0
+        ? `Geocodificando direcciones: <b>${data.pending_geocode}</b> pendientes${failedLine}`
+        : `Geocoding completo${failedLine}`);
+  const now = Date.now();
+  state.lastEnrichPollAt = now;
+  state.lastPendingGeocode = data.pending_geocode || 0;
+  bar.classList.remove('hidden');
+  // Show the "forzar geocoding" button when the sub-zones flag is on (server
+  // returns `pending_geocode` as a number) — it's safe even with 0 pendings
+  // because the user may want to backfill ML/Remax addresses first.
+  const geoButton = geoAvailable
+    ? '<button id="enrich-geo-btn" class="btn-small" title="Backfill addresses de ML/Remax y disparar el loop de geocoding ahora">Forzar geocoding</button>'
+    : '';
+  const retryFailedButton = failedGeo > 0
+    ? `<button id="enrich-retry-failed-btn" class="btn-small" title="Limpia el marker geocode_failed_at de los ${failedGeo} listings que fallaron y re-corre el geocoder">Reintentar fallidos (${failedGeo})</button>`
+    : '';
+  bar.innerHTML = `
+    <span>${headline} <span class="enrich-fresh" data-ts="${now}">· actualizado recién</span></span>
+    <span style="display:flex;gap:8px;">
+      ${retryFailedButton}
+      ${geoButton}
+      <button id="enrich-refresh-btn" class="btn-small">Refrescar resultados</button>
+    </span>
+  `;
+  document.getElementById('enrich-refresh-btn').onclick = async () => {
+    const aid = state.analysis?.id;
+    await Promise.all([renderStats(aid), loadRanking(aid), loadSources(aid)]);
+  };
+  const retryFailedBtn = document.getElementById('enrich-retry-failed-btn');
+  if (retryFailedBtn) {
+    retryFailedBtn.onclick = async () => {
+      retryFailedBtn.disabled = true;
+      retryFailedBtn.textContent = 'Reintentando…';
+      try {
+        const neighborhoods = (state.analysis?.neighborhoods || []).join(',');
+        const url = '/api/stats/retry-failed-geocoding' + (neighborhoods ? `?neighborhoods=${encodeURIComponent(neighborhoods)}` : '');
+        const r = await fetch(url, { method: 'POST' });
+        const out = await r.json();
+        if (r.ok) {
+          retryFailedBtn.textContent = `OK: ${out.reset} reseteados`;
+          setTimeout(() => pollEnrichStatus(), 2000);
+        } else {
+          retryFailedBtn.textContent = `Falló: ${out.error || r.status}`;
+          setTimeout(() => { retryFailedBtn.disabled = false; retryFailedBtn.textContent = `Reintentar fallidos (${failedGeo})`; }, 4000);
+        }
+      } catch (err) {
+        retryFailedBtn.textContent = `Error: ${err.message}`;
+        setTimeout(() => { retryFailedBtn.disabled = false; retryFailedBtn.textContent = `Reintentar fallidos (${failedGeo})`; }, 4000);
+      }
+    };
+  }
+  const geoBtn = document.getElementById('enrich-geo-btn');
+  if (geoBtn) {
+    geoBtn.onclick = async () => {
+      geoBtn.disabled = true;
+      geoBtn.textContent = 'Procesando…';
+      try {
+        const r = await fetch('/api/stats/run-geocoding', { method: 'POST' });
+        const out = await r.json();
+        if (r.ok) {
+          geoBtn.textContent = `OK: ${out.backfilled} backfilled, ${out.pending_geocode} en cola`;
+          // Re-fetch enrich-status soon so the user sees the new pending count.
+          setTimeout(() => pollEnrichStatus(), 2000);
+        } else {
+          geoBtn.textContent = `Falló: ${out.error || r.status}`;
+          setTimeout(() => { geoBtn.disabled = false; geoBtn.textContent = 'Forzar geocoding'; }, 4000);
+        }
+      } catch (err) {
+        geoBtn.textContent = `Error: ${err.message}`;
+        setTimeout(() => { geoBtn.disabled = false; geoBtn.textContent = 'Forzar geocoding'; }, 4000);
+      }
+    };
+  }
+  // Tick the freshness label every 30s so the user sees the timestamp
+  // advance between polls (poll fires once on load, then every 15 min).
+  if (state.enrichFreshHandle) clearInterval(state.enrichFreshHandle);
+  state.enrichFreshHandle = setInterval(() => {
+    const el = document.querySelector('#enrich-status .enrich-fresh');
+    if (!el) { clearInterval(state.enrichFreshHandle); state.enrichFreshHandle = null; return; }
+    const ts = Number(el.dataset.ts) || 0;
+    const ago = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (ago < 60) el.textContent = `· hace ${ago}s`;
+    else if (ago < 3600) el.textContent = `· hace ${Math.round(ago / 60)} min`;
+    else el.textContent = `· hace ${Math.round(ago / 3600)} h`;
+  }, 30_000);
+  // Sub-zone labels are computed continuously by the background geocoder, so
+  // refresh the chip panel of every visible neighborhood-block on each poll.
+  document.querySelectorAll('.neighborhood-block[data-neighborhood]').forEach((block) => {
+    const n = block.dataset.neighborhood;
+    if (n) populateSubZonePanel(block, n, null);
+  });
+  state.lastEnrichPending = data.pending;
+  // First poll fires immediately on page-load (from loadResults); subsequent
+  // polls every 15 min — enough to see meaningful progress on a slow ML
+  // enrich without hammering the endpoint or animating the banner.
+  state.enrichPollHandle = setTimeout(pollEnrichStatus, 15 * 60 * 1000);
 }
 
 async function loadSources() {
@@ -1192,13 +1350,18 @@ async function openCellModal({ matrix, neighborhood, age, rooms }) {
   `;
 }
 
-function renderNeighborhoodStats(s) {
+function renderNeighborhoodStats(s, opts = {}) {
   const block = document.createElement('div');
   block.className = 'neighborhood-block';
+  block.dataset.neighborhood = s.neighborhood;
   const sample = s.sample_total || 0;
   const usd = s.usd_per_m2 || {};
+  const subZoneBadge = opts.subZone
+    ? `<span class="badge warn">sub-zona: ${escapeHtml(opts.subZoneLabel || opts.subZone)}</span>`
+    : '';
   block.innerHTML = `
-    <h3>${s.neighborhood} <span class="badge">${sample} listings</span></h3>
+    <h3>${s.neighborhood} <span class="badge">${sample} listings</span> ${subZoneBadge}</h3>
+    <div class="subzone-panel" data-subzone-panel></div>
     <div class="stat-grid">
       ${statCard('USD/m² disponible (mediana)', usd.disponible)}
       ${statCard('USD/m² en pozo (mediana)', usd.en_pozo)}
@@ -1210,9 +1373,126 @@ function renderNeighborhoodStats(s) {
     <h4 style="margin-top:14px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">Antigüedad × ambientes (USD/m² venta)</h4>
     ${renderAgeMatrix(s.age_x_rooms || {}, { matrixKind: 'venta', neighborhood: s.neighborhood })}
     <h4 style="margin-top:14px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">Alquiler mensual × ambientes × antigüedad</h4>
-    ${renderAgeMatrix(s.rent_age_x_rooms || {}, { matrixKind: 'alquiler', neighborhood: s.neighborhood, unitLabel: 'USD/mes', caption: 'Mediana USD/mes de alquiler cruzando antigüedad × ambientes. n = total. Abajo, cuántas por fuente.' })}
+    ${renderAgeMatrix(s.rent_age_x_rooms || {}, {
+      matrixKind: 'alquiler',
+      neighborhood: s.neighborhood,
+      unitLabel: 'USD/mes',
+      secondaryMatrix: s.rent_per_m2_age_x_rooms || {},
+      secondaryLabel: 'USD/m²/mes',
+      secondaryFmt: (v) => v.toFixed(2),
+      caption: 'Mediana USD/mes (grande) y USD/m²/mes (chico, color acento) cruzando antigüedad × ambientes. n = total. Abajo, cuántas por fuente.',
+    })}
+    <h4 style="margin-top:14px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">Alquiler × antigüedad × tamaño (chico/normal/grande)</h4>
+    ${renderAgeMatrix(s.rent_age_x_size || {}, {
+      matrixKind: 'alquiler-size',
+      neighborhood: s.neighborhood,
+      unitLabel: 'USD/mes',
+      buckets: ['1-mono', '2-chico', '2-normal', '2-grande', '3-chico', '3-normal', '3-grande', '4+', 'ph-casa'],
+      bucketLabels: {
+        '1-mono': 'Mono',
+        '2-chico': '2 chico',
+        '2-normal': '2 normal',
+        '2-grande': '2 grande',
+        '3-chico': '3 chico',
+        '3-normal': '3 normal',
+        '3-grande': '3 grande',
+        '4+': '4+',
+        'ph-casa': 'PH/casa',
+      },
+      secondaryMatrix: s.rent_per_m2_age_x_size || {},
+      secondaryLabel: 'USD/m²/mes',
+      secondaryFmt: (v) => v.toFixed(2),
+      caption: 'Mismo cruce que la tabla anterior, pero separando cada ambiente por m² (chico/normal/grande). Evita promediar un 2-amb 100m² con un 2-amb 45m².',
+    })}
   `;
+  // Lazy-load the sub-zones chip panel. The endpoint 404s when the feature
+  // flag is off; we render nothing in that case (silent no-op).
+  populateSubZonePanel(block, s.neighborhood, opts.subZone || null);
   return block;
+}
+
+async function populateSubZonePanel(block, neighborhood, activeSubZone) {
+  let data;
+  let status;
+  try {
+    const [zonesRes, statusRes] = await Promise.all([
+      fetch('/api/stats/subzones?neighborhood=' + encodeURIComponent(neighborhood)),
+      fetch('/api/stats/enrich-status?neighborhoods=' + encodeURIComponent(neighborhood)),
+    ]);
+    if (!zonesRes.ok) return; // 404 when feature flag off — silently skip.
+    data = await zonesRes.json();
+    if (statusRes.ok) status = await statusRes.json();
+  } catch {
+    return;
+  }
+  const list = data?.sub_zones || [];
+  const panel = block.querySelector('[data-subzone-panel]');
+  if (!panel) return;
+  // Build the "Total geocodificados / total listings" progress hint so the
+  // user understands why chip counts don't add up to the listing total in
+  // the title (388 still pending geocoding, etc.).
+  const geocodedInZones = list.reduce((a, z) => a + (z.count || 0), 0);
+  const totalListings = status?.total ?? null;
+  const pendingGeocode = status?.pending_geocode ?? null;
+  const progressBits = [];
+  if (totalListings != null) progressBits.push(`${geocodedInZones} de ${totalListings} listings con coordenadas`);
+  if (pendingGeocode != null && pendingGeocode > 0) progressBits.push(`${pendingGeocode} pendientes`);
+  const progress = progressBits.length > 0 ? ` · ${progressBits.join(' · ')}` : '';
+  if (list.length === 0) {
+    // No chips yet — show the empty-state hint so the user knows the panel
+    // exists and is waiting, instead of being silently hidden.
+    panel.innerHTML = `<div class="subzone-chips empty"><span class="subzone-title">Sub-zonas (beta):</span> <em>aún procesando${progress}</em></div>`;
+    return;
+  }
+  const chips = [
+    `<button class="chip-subzone ${!activeSubZone ? 'active' : ''}" data-subzone="">Todo el barrio</button>`,
+    ...list.map((z) =>
+      `<button class="chip-subzone ${activeSubZone === z.sub_zone ? 'active' : ''}" data-subzone="${escapeHtml(z.sub_zone)}" title="${escapeHtml(z.sub_zone)}">${escapeHtml(z.label)} <span class="chip-count">${z.count}</span></button>`
+    ),
+  ].join(' ');
+  panel.innerHTML = `
+    <div class="subzone-chips">
+      <span class="subzone-title">Sub-zonas (beta):</span> ${chips}
+    </div>
+    <div class="subzone-progress">${progress.replace(/^ · /, '')}</div>
+  `;
+  panel.querySelectorAll('.chip-subzone').forEach((btn) => {
+    btn.onclick = () => {
+      const sub = btn.dataset.subzone || null;
+      const label = sub ? list.find((z) => z.sub_zone === sub)?.label : null;
+      reloadNeighborhoodStats(neighborhood, { subZone: sub, subZoneLabel: label });
+    };
+  });
+}
+
+async function reloadNeighborhoodStats(neighborhood, { subZone, subZoneLabel } = {}) {
+  const params = new URLSearchParams();
+  if (state.analysis?.id) {
+    params.set('analysis_id', state.analysis.id);
+  } else {
+    params.set('neighborhoods', neighborhood);
+  }
+  if (subZone) params.set('sub_zone', subZone);
+  const r = await fetch('/api/stats?' + params.toString());
+  const data = await r.json();
+  const newStats = (data.per_neighborhood || []).find((s) => s.neighborhood === neighborhood);
+  if (!newStats) return;
+  const block = document.querySelector(`.neighborhood-block[data-neighborhood="${CSS.escape(neighborhood)}"]`);
+  if (!block) return;
+  const replaced = renderNeighborhoodStats(newStats, { subZone, subZoneLabel });
+  block.replaceWith(replaced);
+  // Re-wire the cell-info buttons inside the replaced block.
+  replaced.querySelectorAll('button.btn-info-cell').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      openCellModal({
+        matrix: btn.dataset.matrix,
+        neighborhood: btn.dataset.neighborhood,
+        age: btn.dataset.age,
+        rooms: btn.dataset.rooms,
+      });
+    };
+  });
 }
 
 // Short line describing the premium tail Stats excluded from the headline
@@ -1269,7 +1549,16 @@ function bySourceLine(by) {
 function renderAgeMatrix(matrix, opts = {}) {
   const matrixKind = opts.matrixKind || 'venta'; // for the ℹ️ deep-link
   const neighborhood = opts.neighborhood || null;
-  const buckets = ['1', '2', '3', '4', '5+'];
+  // Optional secondary matrix rendered as a small extra line in each cell —
+  // used for the rent table to show USD/m²/mes alongside the absolute USD/mes.
+  const secondaryMatrix = opts.secondaryMatrix || null;
+  const secondaryFmt = opts.secondaryFmt || ((v) => fmtUsd(v));
+  const secondaryLabel = opts.secondaryLabel || '';
+  // Column dimension: defaults to room buckets, but callers can override
+  // (e.g. size buckets "2-chico" / "2-normal" / "2-grande" …).
+  const buckets = opts.buckets || ['1', '2', '3', '4', '5+'];
+  const bucketLabels = opts.bucketLabels || null;
+  const bucketHeaderSuffix = opts.bucketHeaderSuffix ?? ' amb';
   const ages = ['a-estrenar', '0-5', '5-20', '20-50', '50+'];
   const ageLabels = {
     'a-estrenar': 'A estrenar',
@@ -1285,12 +1574,14 @@ function renderAgeMatrix(matrix, opts = {}) {
   let html = '<div class="matrix">';
   // Header row: one empty corner cell + N column headers.
   html +=
-    '<div class="head"></div>' + buckets.map((b) => `<div class="head">${b} amb</div>`).join('');
+    '<div class="head"></div>' +
+    buckets.map((b) => `<div class="head">${bucketLabels?.[b] ?? `${b}${bucketHeaderSuffix}`}</div>`).join('');
   // Data rows: one row-head label + N data cells.
   for (const a of ages) {
     html += `<div class="row-head">${ageLabels[a]}</div>`;
     for (const b of buckets) {
       const s = matrix[a]?.[b];
+      const s2 = secondaryMatrix?.[a]?.[b];
       let v = '—';
       if (s && s.median != null) {
         const canInspect = neighborhood && s.n > 0;
@@ -1298,6 +1589,9 @@ function renderAgeMatrix(matrix, opts = {}) {
           ? ` <button class="btn-info-cell" data-matrix="${matrixKind}" data-neighborhood="${neighborhood}" data-age="${a}" data-rooms="${b}" title="Ver listings de esta celda">ℹ️</button>`
           : '';
         v = `${fmtUsd(s.median)}${info}<br><span style="color:var(--muted);font-size:10px">n=${s.n}</span>`;
+        if (s2 && s2.median != null) {
+          v += `<br><span style="color:var(--accent);font-size:11px">${secondaryFmt(s2.median)} ${secondaryLabel}</span>`;
+        }
         const src = bySourceLine(s.by_source);
         if (src) v += `<br><span style="color:var(--muted);font-size:10px">${src}</span>`;
         const o = s.outliers;
@@ -1520,12 +1814,41 @@ function renderRankingTable() {
         it.rental_yield_pct != null
           ? `<span class="badge ok">${fmtPct(it.rental_yield_pct)} alq</span>`
           : `<span class="badge warn">${fmtPct(it.build_yield_pct)} build</span>`;
-      const refDisplay =
-        it.rent_estimate_usd != null
-          ? `alq ~ ${fmtUsd(it.rent_estimate_usd)}/mes (${it.rent_source})`
-          : it.ref_usd_per_m2 != null
-            ? `ref ${fmtUsd(it.ref_usd_per_m2)} USD/m² (${it.build_ref_source})`
-            : '';
+      // Compose the rent-reference label. The suffix tells the user how
+      // hyper-local the reference was: strict sub-zone, sub-zone+vecinas,
+      // or barrio-wide.
+      let rentSourceLabel = it.rent_source;
+      if (it.rent_match_level === 'subzone' && it.rent_sub_zone_label) {
+        rentSourceLabel = `scraped · ${it.rent_sub_zone_label}`;
+      } else if (it.rent_match_level === 'subzone-expanded' && it.rent_sub_zone_label) {
+        rentSourceLabel = `scraped · ${it.rent_sub_zone_label} + vecinas`;
+      } else if (it.rent_match_level === 'subzone-expanded') {
+        rentSourceLabel = 'scraped · sub-zona + vecinas';
+      } else if (it.rent_match_level === 'neighborhood' && it.rent_source === 'scraped') {
+        rentSourceLabel = 'scraped · barrio';
+      } else if (it.rent_match_level === 'fallback') {
+        rentSourceLabel = 'fallback (tabla seed)';
+      }
+      const primaryRent = it.rent_estimate_usd != null
+        ? `alq ~ ${fmtUsd(it.rent_estimate_usd)}/mes (${rentSourceLabel}${it.rent_rate_per_m2 != null ? `, ${fmtUsd(it.rent_rate_per_m2)}/m²` : ''})`
+        : it.ref_usd_per_m2 != null
+          ? `ref ${fmtUsd(it.ref_usd_per_m2)} USD/m² (${it.build_ref_source})`
+          : '';
+      // Sub-zone anchored alternative: shown in a second line, accent color,
+      // when the primary cascade landed on barrio/fallback. Gives the user
+      // "if we just averaged your hex (or ring 1) you'd pay $X".
+      let altLine = '';
+      if (it.rent_subzone_alt_usd != null && it.rent_estimate_usd != null) {
+        const scopeLabel =
+          it.rent_subzone_alt_scope === 'own' ? 'sub-zona' :
+          it.rent_subzone_alt_scope === 'ring1' ? 'sub-zona ±1' :
+          it.rent_subzone_alt_scope === 'inferred' ? 'sub-zona inferida del address' :
+          'sub-zona';
+        const zoneLabel = it.rent_subzone_alt_label ? ` "${it.rent_subzone_alt_label}"` : '';
+        const rateBit = it.rent_subzone_alt_rate != null ? `, ${fmtUsd(it.rent_subzone_alt_rate)}/m²` : '';
+        altLine = `<br><span style="color:var(--accent);font-size:11px">≈ ${fmtUsd(it.rent_subzone_alt_usd)}/mes si mergeáramos con ${scopeLabel}${zoneLabel} (n=${it.rent_subzone_alt_n}${rateBit})</span>`;
+      }
+      const refDisplay = primaryRent + altLine;
       const links = [`<a href="${it.url}" target="_blank" rel="noopener">${it.source}</a>`];
       if (it.duplicates) {
         for (const d of it.duplicates) {

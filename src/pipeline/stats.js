@@ -1,5 +1,6 @@
 import { getDb } from '../db.js';
 import { config } from '../config.js';
+import { sizeBucket } from './size-bucket.js';
 
 function median(nums) {
   if (!nums.length) return null;
@@ -160,14 +161,19 @@ function applyFiltersToRows(rows, filters = {}) {
 
 export function computeStatsForNeighborhood(neighborhood, filters = {}) {
   const db = getDb();
+  // Optional sub-zone scoping (v2 feature): when filters.sub_zone is set we
+  // narrow every read to that H3 cell. With it null/undefined the behavior
+  // is identical to v1 — no behavior change for existing callers.
+  const subZone = filters.sub_zone || null;
+  const subZoneClause = subZone ? ' AND sub_zone = ?' : '';
   const all = db
     .prepare(
       `SELECT source, rooms, has_pool, has_garage, age_band, status, price_usd, homogenized_m2
        FROM listings
        WHERE neighborhood = ? AND operation = 'venta' AND active = 1
-         AND price_usd > 0 AND homogenized_m2 > 0`,
+         AND price_usd > 0 AND homogenized_m2 > 0${subZoneClause}`,
     )
-    .all(neighborhood);
+    .all(...(subZone ? [neighborhood, subZone] : [neighborhood]));
   // Dedup cross-portal: same physical apartment listed on argenprop + ML +
   // zonaprop counts once. See `dedupListings` for the matching rule.
   const filtered = applyFiltersToRows(all, filters);
@@ -226,28 +232,73 @@ export function computeStatsForNeighborhood(neighborhood, filters = {}) {
   // would rent for in this neighborhood.
   const rentRowsRaw = db
     .prepare(
-      `SELECT source, rooms, age_band, price_usd, homogenized_m2, neighborhood
+      `SELECT source, rooms, age_band, price_usd, homogenized_m2, neighborhood, property_type
        FROM listings
        WHERE neighborhood = ? AND operation = 'alquiler' AND active = 1
-         AND price_usd > 0 AND price_usd < 5000`,
+         AND price_usd > 0 AND price_usd < 5000${subZoneClause}`,
     )
-    .all(neighborhood);
+    .all(...(subZone ? [neighborhood, subZone] : [neighborhood]));
   // Same dedup as venta: a 3-amb in Forum Alcorta posted to 4 portals at
   // $2.800/mes should count once, not four times.
   const rentRows = dedupListings(rentRowsRaw);
   const rentMatrix = {};
+  // Parallel matrix in USD/m²/mes — same buckets, but values are
+  // `price_usd / homogenized_m2`. Lets the UI show the rent-rate next to the
+  // absolute monthly rent so the user can compare a-estrenar 2-amb (smaller
+  // unit, higher $/m²) vs a 20-50 años 2-amb (bigger unit, lower $/m²).
+  const rentPerM2Matrix = {};
+  // Size-bucket matrices: split each rooms count into chico/normal/grande by
+  // homogenized_m2 so a 2-amb 100m² doesn't get averaged with a 2-amb 45m².
+  // Axis: age_band × size_bucket (instead of × rooms_bucket).
+  const rentSizeMatrix = {};
+  const rentPerM2SizeMatrix = {};
   for (const r of rentRows) {
     const bucket = roomsBucket(r.rooms);
-    if (!bucket) continue;
+    const sBucket = sizeBucket(r.rooms, r.homogenized_m2, r.property_type);
     const age = r.age_band || 'unknown';
-    const m = (rentMatrix[age] ??= {});
-    (m[bucket] ??= []).push({ price: r.price_usd, source: r.source });
+    if (bucket) {
+      const m = (rentMatrix[age] ??= {});
+      (m[bucket] ??= []).push({ price: r.price_usd, source: r.source });
+      if (r.homogenized_m2 > 0) {
+        const m2 = (rentPerM2Matrix[age] ??= {});
+        (m2[bucket] ??= []).push({ price: r.price_usd / r.homogenized_m2, source: r.source });
+      }
+    }
+    if (sBucket) {
+      const sm = (rentSizeMatrix[age] ??= {});
+      (sm[sBucket] ??= []).push({ price: r.price_usd, source: r.source });
+      if (r.homogenized_m2 > 0) {
+        const sm2 = (rentPerM2SizeMatrix[age] ??= {});
+        (sm2[sBucket] ??= []).push({ price: r.price_usd / r.homogenized_m2, source: r.source });
+      }
+    }
   }
   const rentByAgeRooms = {};
   for (const [age, byRoom] of Object.entries(rentMatrix)) {
     rentByAgeRooms[age] = {};
     for (const [bucket, arr] of Object.entries(byRoom)) {
       rentByAgeRooms[age][bucket] = describe(arr);
+    }
+  }
+  const rentPerM2ByAgeRooms = {};
+  for (const [age, byRoom] of Object.entries(rentPerM2Matrix)) {
+    rentPerM2ByAgeRooms[age] = {};
+    for (const [bucket, arr] of Object.entries(byRoom)) {
+      rentPerM2ByAgeRooms[age][bucket] = describe(arr);
+    }
+  }
+  const rentByAgeSize = {};
+  for (const [age, bySize] of Object.entries(rentSizeMatrix)) {
+    rentByAgeSize[age] = {};
+    for (const [bucket, arr] of Object.entries(bySize)) {
+      rentByAgeSize[age][bucket] = describe(arr);
+    }
+  }
+  const rentPerM2ByAgeSize = {};
+  for (const [age, bySize] of Object.entries(rentPerM2SizeMatrix)) {
+    rentPerM2ByAgeSize[age] = {};
+    for (const [bucket, arr] of Object.entries(bySize)) {
+      rentPerM2ByAgeSize[age][bucket] = describe(arr);
     }
   }
 
@@ -259,6 +310,9 @@ export function computeStatsForNeighborhood(neighborhood, filters = {}) {
     with_pool: withPool,
     age_x_rooms: ageXRooms,
     rent_age_x_rooms: rentByAgeRooms,
+    rent_per_m2_age_x_rooms: rentPerM2ByAgeRooms,
+    rent_age_x_size: rentByAgeSize,
+    rent_per_m2_age_x_size: rentPerM2ByAgeSize,
   };
 }
 

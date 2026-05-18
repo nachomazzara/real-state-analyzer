@@ -1,0 +1,29 @@
+{
+  "_comment": "Listings whose address matches any pattern get assigned a fixed sub_zone instead of their H3 cell. Used for avenues whose price profile differs dramatically from the surrounding barrio (premium frente al verde, parque, etc.). Matched substring-style on a normalized (lowercase + accent-stripped) address. Patterns are case-insensitive.",
+  "nunez": [
+    {
+      "id": "av-libertador-nunez",
+      "match": ["libertador"],
+      "label": "Av. del Libertador (Núñez)"
+    },
+    {
+      "id": "av-figueroa-alcorta-nunez",
+      "match": ["figueroa alcorta"],
+      "label": "Av. Figueroa Alcorta (Núñez)"
+    }
+  ],
+  "caballito": [
+    {
+      "id": "av-pedro-goyena-caballito",
+      "match": ["pedro goyena"],
+      "label": "Av. Pedro Goyena (Caballito)"
+    }
+  ],
+  "palermo": [
+    {
+      "id": "av-libertador-palermo",
+      "match": ["av. del libertador", "av del libertador", "avenida del libertador", "del libertador", "av libertador", "av. libertador", "avenida libertador"],
+      "label": "Av. del Libertador (Palermo / Cañitas)"
+    }
+  ]
+}

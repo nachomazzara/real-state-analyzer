@@ -151,7 +151,11 @@ function toListing(card, neighborhood, operation) {
   const feats = parseFeatures(html);
 
   const blob = description.toLowerCase();
-  const has_pool = /pileta|piscina/i.test(blob);
+  // Pool detection — match "pileta"/"piscina" but exclude common false
+  // positives where "pileta" refers to a kitchen/laundry sink:
+  //   "pileta de acero inoxidable", "pileta de cocina", "pileta de servicio",
+  //   "pileta de granito", "pileta de lavar"
+  const has_pool = /(?:^|[^a-záéíóúñ])piscina|(?:^|[^a-záéíóúñ])pileta(?!\s+de\s+(?:acero|cocina|granito|servicio|lavar|lavadero|lavarropas|inox))/i.test(blob);
   const has_garage = detectUnitGarage(blob);
   const has_amenities = /amenit|gimnasio|laundry|seguridad|sum\b/i.test(blob);
 
@@ -297,6 +301,56 @@ export async function enrichDetail(url) {
     .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
     .replace(/\s+/g, ' ');
   if (bodyText) out.description = bodyText.slice(0, 6000);
+  // Address: argenprop embeds the canonical address in two reliable places:
+  //   1) JSON-LD schema.org block — always present, machine-readable, has
+  //      "streetAddress" + "addressRegion" + "addressLocality". This is the
+  //      cleanest source.
+  //   2) <h2 class="titlebar__address"> — same text as JSON-LD, easier to
+  //      grep when JSON-LD isn't parseable.
+  // The h1 is the listing's MARKETING TITLE — sellers put anything there
+  // ("3 amb 63 m² + 12 m²..."), so we never trust it for address.
+  let address = null;
+  // JSON-LD values can contain escape sequences (\uXXXX for ñ, etc.). Match
+  // any sequence of non-quote chars OR backslash-escape pairs, then JSON-
+  // parse to decode the unicode escapes properly.
+  function readJsonField(name) {
+    const re = new RegExp(`"${name}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, '');
+    const m = html.match(re);
+    if (!m) return null;
+    try { return JSON.parse(`"${m[1]}"`); } catch { return null; }
+  }
+  const streetRaw = readJsonField('streetAddress');
+  if (streetRaw) {
+    const street = decode(streetRaw.trim());
+    const region = readJsonField('addressRegion');
+    // Compose "Ciudad De La Paz 3200, Núñez, Capital Federal" — the format
+    // USIG/Nominatim parse best. Strip "Piso N" trailing junk that the
+    // address cleaner would drop anyway.
+    const cleanStreet = street.replace(/,\s*piso\s+\w+.*$/i, '').trim();
+    address = region ? `${cleanStreet}, ${region}, Capital Federal` : cleanStreet;
+  }
+  if (!address) {
+    const h2Match = html.match(/<h2[^>]*class="[^"]*titlebar__address[^"]*"[^>]*>\s*([\s\S]{0,200}?)\s*<\/h2>/i);
+    if (h2Match) {
+      const raw = decode(h2Match[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+      if (raw && /\d{2,5}/.test(raw)) address = raw.replace(/,\s*piso\s+\w+.*$/i, '').trim();
+    }
+  }
+  if (address) out.address = address;
+  // Lat/lng — argenprop embeds the listing's coordinates directly in the
+  // leaflet map container ("data-latitude" / "data-longitude"). Format is
+  // Argentine decimal (comma instead of dot). When present this is far more
+  // accurate than geocoding the address — bypass USIG entirely.
+  const latM = html.match(/data-latitude="(-?\d+[.,]\d+)"/);
+  const lngM = html.match(/data-longitude="(-?\d+[.,]\d+)"/);
+  if (latM && lngM) {
+    const lat = Number(latM[1].replace(',', '.'));
+    const lng = Number(lngM[1].replace(',', '.'));
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      out.lat = lat;
+      out.lng = lng;
+    }
+  }
   return out;
 }
 

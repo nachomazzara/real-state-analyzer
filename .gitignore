@@ -1,8 +1,30 @@
 node_modules/
-data/
 .env
 .env.local
 .env.*.local
 *.log
 .DS_Store
 .claude/settings.local.json
+
+# Runtime data in data/ (DB, cookies, debug, browser profile). Config files
+# (neighborhoods.json, rent-fallback.json, avenue-corridors.json, caba-streets.json)
+# stay tracked because the app needs them to boot.
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/.chrome-profile/
+data/ml-cookies.txt
+data/agent-debug/
+
+# Bench script outputs (geocoder failure/success logs)
+output_*.txt
+
+# Editor swap/backup files
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+.nyc_output/

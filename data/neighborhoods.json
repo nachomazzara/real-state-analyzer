@@ -1,0 +1,541 @@
+{
+  "neighborhoods": [
+    {
+      "id": "agronomia",
+      "display": "Agronomía",
+      "region": "CABA",
+      "aliases": [
+        "agronomia"
+      ],
+      "remax_location_id": 25001,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "almagro",
+      "display": "Almagro",
+      "region": "CABA",
+      "aliases": [
+        "almagro"
+      ],
+      "remax_location_id": 25002,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "balvanera",
+      "display": "Balvanera",
+      "region": "CABA",
+      "aliases": [
+        "balvanera",
+        "once",
+        "abasto"
+      ],
+      "remax_location_id": 25003,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "barracas",
+      "display": "Barracas",
+      "region": "CABA",
+      "aliases": [
+        "barracas"
+      ],
+      "remax_location_id": 25004,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "belgrano",
+      "display": "Belgrano",
+      "region": "CABA",
+      "aliases": [
+        "belgrano",
+        "belgrano-c",
+        "belgrano-r",
+        "barrio-chino"
+      ],
+      "remax_location_id": 25006,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "boedo",
+      "display": "Boedo",
+      "region": "CABA",
+      "aliases": [
+        "boedo"
+      ],
+      "remax_location_id": 25008,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "caballito",
+      "display": "Caballito",
+      "region": "CABA",
+      "aliases": [
+        "caballito"
+      ],
+      "remax_location_id": 25009,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "chacarita",
+      "display": "Chacarita",
+      "region": "CABA",
+      "aliases": [
+        "chacarita"
+      ],
+      "remax_location_id": 25011,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "coghlan",
+      "display": "Coghlan",
+      "region": "CABA",
+      "aliases": [
+        "coghlan"
+      ],
+      "remax_location_id": 25012,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "colegiales",
+      "display": "Colegiales",
+      "region": "CABA",
+      "aliases": [
+        "colegiales"
+      ],
+      "remax_location_id": 25013,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "constitucion",
+      "display": "Constitución",
+      "region": "CABA",
+      "aliases": [
+        "constitucion"
+      ],
+      "remax_location_id": 25015,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "flores",
+      "display": "Flores",
+      "region": "CABA",
+      "aliases": [
+        "flores",
+        "parque-chacabuco"
+      ],
+      "remax_location_id": 25016,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "floresta",
+      "display": "Floresta",
+      "region": "CABA",
+      "aliases": [
+        "floresta"
+      ],
+      "remax_location_id": 25017,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "la-boca",
+      "display": "La Boca",
+      "region": "CABA",
+      "aliases": [
+        "la-boca",
+        "boca"
+      ],
+      "remax_location_id": 25007,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "la-paternal",
+      "display": "La Paternal",
+      "region": "CABA",
+      "aliases": [
+        "la-paternal",
+        "paternal"
+      ],
+      "remax_location_id": 25030,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "liniers",
+      "display": "Liniers",
+      "region": "CABA",
+      "aliases": [
+        "liniers"
+      ],
+      "remax_location_id": 25018,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "mataderos",
+      "display": "Mataderos",
+      "region": "CABA",
+      "aliases": [
+        "mataderos"
+      ],
+      "remax_location_id": 25019,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "monserrat",
+      "display": "Monserrat",
+      "region": "CABA",
+      "aliases": [
+        "monserrat",
+        "montserrat"
+      ],
+      "remax_location_id": 25020,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "monte-castro",
+      "display": "Monte Castro",
+      "region": "CABA",
+      "aliases": [
+        "monte-castro"
+      ],
+      "remax_location_id": 25021,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "nueva-pompeya",
+      "display": "Nueva Pompeya",
+      "region": "CABA",
+      "aliases": [
+        "nueva-pompeya",
+        "pompeya"
+      ],
+      "remax_location_id": 25031,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "nunez",
+      "display": "Núñez",
+      "region": "CABA",
+      "aliases": [
+        "nunez",
+        "núñez"
+      ],
+      "remax_location_id": 25022,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "palermo",
+      "display": "Palermo",
+      "region": "CABA",
+      "aliases": [
+        "palermo",
+        "palermo-hollywood",
+        "palermo-soho",
+        "palermo-chico",
+        "palermo-viejo",
+        "las-canitas"
+      ],
+      "remax_location_id": 25024,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "parque-avellaneda",
+      "display": "Parque Avellaneda",
+      "region": "CABA",
+      "aliases": [
+        "parque-avellaneda"
+      ],
+      "remax_location_id": 25025,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "parque-chas",
+      "display": "Parque Chas",
+      "region": "CABA",
+      "aliases": [
+        "parque-chas"
+      ],
+      "remax_location_id": 25028,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "parque-patricios",
+      "display": "Parque Patricios",
+      "region": "CABA",
+      "aliases": [
+        "parque-patricios"
+      ],
+      "remax_location_id": 25029,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "puerto-madero",
+      "display": "Puerto Madero",
+      "region": "CABA",
+      "aliases": [
+        "puerto-madero"
+      ],
+      "remax_location_id": 25032,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "recoleta",
+      "display": "Recoleta",
+      "region": "CABA",
+      "aliases": [
+        "recoleta",
+        "barrio-norte"
+      ],
+      "remax_location_id": 25033,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "retiro",
+      "display": "Retiro",
+      "region": "CABA",
+      "aliases": [
+        "retiro"
+      ],
+      "remax_location_id": 25034,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "saavedra",
+      "display": "Saavedra",
+      "region": "CABA",
+      "aliases": [
+        "saavedra"
+      ],
+      "remax_location_id": 25035,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "san-cristobal",
+      "display": "San Cristóbal",
+      "region": "CABA",
+      "aliases": [
+        "san-cristobal"
+      ],
+      "remax_location_id": 25036,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "san-nicolas",
+      "display": "San Nicolás",
+      "region": "CABA",
+      "aliases": [
+        "san-nicolas",
+        "microcentro"
+      ],
+      "remax_location_id": 25037,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "san-telmo",
+      "display": "San Telmo",
+      "region": "CABA",
+      "aliases": [
+        "san-telmo"
+      ],
+      "remax_location_id": 25038,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "velez-sarsfield",
+      "display": "Vélez Sarsfield",
+      "region": "CABA",
+      "aliases": [
+        "velez-sarsfield"
+      ],
+      "remax_location_id": 25040,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "versalles",
+      "display": "Versalles",
+      "region": "CABA",
+      "aliases": [
+        "versalles"
+      ],
+      "remax_location_id": 25041,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-crespo",
+      "display": "Villa Crespo",
+      "region": "CABA",
+      "aliases": [
+        "villa-crespo"
+      ],
+      "remax_location_id": 25042,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-del-parque",
+      "display": "Villa del Parque",
+      "region": "CABA",
+      "aliases": [
+        "villa-del-parque"
+      ],
+      "remax_location_id": 25043,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-devoto",
+      "display": "Villa Devoto",
+      "region": "CABA",
+      "aliases": [
+        "villa-devoto",
+        "devoto"
+      ],
+      "remax_location_id": 25044,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-general-mitre",
+      "display": "Villa General Mitre",
+      "region": "CABA",
+      "aliases": [
+        "villa-general-mitre"
+      ],
+      "remax_location_id": 25045,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-lugano",
+      "display": "Villa Lugano",
+      "region": "CABA",
+      "aliases": [
+        "villa-lugano"
+      ],
+      "remax_location_id": 25046,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-luro",
+      "display": "Villa Luro",
+      "region": "CABA",
+      "aliases": [
+        "villa-luro"
+      ],
+      "remax_location_id": 25047,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-ortuzar",
+      "display": "Villa Ortúzar",
+      "region": "CABA",
+      "aliases": [
+        "villa-ortuzar"
+      ],
+      "remax_location_id": 25048,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-pueyrredon",
+      "display": "Villa Pueyrredón",
+      "region": "CABA",
+      "aliases": [
+        "villa-pueyrredon"
+      ],
+      "remax_location_id": 25049,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-real",
+      "display": "Villa Real",
+      "region": "CABA",
+      "aliases": [
+        "villa-real"
+      ],
+      "remax_location_id": 25050,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-riachuelo",
+      "display": "Villa Riachuelo",
+      "region": "CABA",
+      "aliases": [
+        "villa-riachuelo"
+      ],
+      "remax_location_id": 25051,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-santa-rita",
+      "display": "Villa Santa Rita",
+      "region": "CABA",
+      "aliases": [
+        "villa-santa-rita"
+      ],
+      "remax_location_id": 25052,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-soldati",
+      "display": "Villa Soldati",
+      "region": "CABA",
+      "aliases": [
+        "villa-soldati"
+      ],
+      "remax_location_id": 25053,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "villa-urquiza",
+      "display": "Villa Urquiza",
+      "region": "CABA",
+      "aliases": [
+        "villa-urquiza"
+      ],
+      "remax_location_id": 25054,
+      "remax_state": "capital federal"
+    },
+    {
+      "id": "vicente-lopez",
+      "display": "Vicente López",
+      "region": "GBA Norte",
+      "aliases": [
+        "vicente-lopez",
+        "florida",
+        "olivos"
+      ],
+      "remax_state": "buenos aires",
+      "remax_county_id": 131
+    },
+    {
+      "id": "san-isidro",
+      "display": "San Isidro",
+      "region": "GBA Norte",
+      "aliases": [
+        "san-isidro",
+        "martinez",
+        "acassuso",
+        "beccar"
+      ],
+      "remax_state": "buenos aires",
+      "remax_county_id": 116
+    },
+    {
+      "id": "san-fernando",
+      "display": "San Fernando",
+      "region": "GBA Norte",
+      "aliases": [
+        "san-fernando",
+        "victoria"
+      ],
+      "remax_state": "buenos aires",
+      "remax_county_id": 115
+    },
+    {
+      "id": "tigre",
+      "display": "Tigre",
+      "region": "GBA Norte",
+      "aliases": [
+        "tigre",
+        "nordelta",
+        "rincon-de-milberg"
+      ],
+      "remax_state": "buenos aires",
+      "remax_county_id": 124
+    }
+  ]
+}

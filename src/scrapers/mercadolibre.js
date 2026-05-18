@@ -139,7 +139,8 @@ function toListing(raw, neighborhood, operation) {
   // "1 cochera" lives in attrBlob, not in the description — checking only
   // description misses the majority of garage signals.
   const amenityBlob = ((raw.title || '') + ' ' + (raw.description || '') + ' ' + (raw.attrBlob || '')).toLowerCase();
-  const has_pool = /pileta|piscina/.test(amenityBlob);
+  // Exclude false positives like "pileta de acero inoxidable" (kitchen sink).
+  const has_pool = /(?:^|[^a-záéíóúñ])piscina|(?:^|[^a-záéíóúñ])pileta(?!\s+de\s+(?:acero|cocina|granito|servicio|lavar|lavadero|lavarropas|inox))/i.test(amenityBlob);
   const has_garage = /\bcochera|\bgarage|\bgaraje|estacionamiento/.test(amenityBlob);
   const has_amenities = /amenit|gimnasio|laundry|seguridad|\bsum\b/.test(amenityBlob);
 
@@ -191,6 +192,12 @@ async function fetchPage(neighborhood, operation, offset, orderSuffix = '') {
     // `networkidle` waits forever on ML's heavy listings page. domcontentloaded
     // + an explicit selector wait is both faster and more reliable.
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    const finalUrl = page.url();
+    const text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
+    const authFail = detectAuthFailure(finalUrl, text);
+    if (authFail) {
+      throw new MercadoLibreAuthError(`${authFail} — cookies likely expired, refresh data/ml-cookies.txt`);
+    }
     await page
       .waitForSelector(
         'li.ui-search-layout__item, .ui-search-rescue, .ui-search-zrp__title',
@@ -211,11 +218,39 @@ export class MercadoLibreBlockedError extends Error {
   }
 }
 
+// Thrown when ML signals the session is logged out / cookies are invalid.
+// This is unrecoverable without a manual cookie refresh (data/ml-cookies.txt),
+// so the orchestrator must stop hitting ML for the rest of the run instead of
+// retrying every listing 3 times and burning hours producing nothing.
+export class MercadoLibreAuthError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'MercadoLibreAuthError';
+  }
+}
+
+// Centralized auth-state detection. Runs after a navigation completed: checks
+// both the final URL (login/registration redirects) and the rendered text
+// (ML's "Ingresá a tu cuenta para continuar" prompts). Returns null if the
+// session looks fine, or an error message if auth is broken.
+function detectAuthFailure(finalUrl, text) {
+  if (/\/(jms\/mla\/lgz\/)?login|auth\.mercadolibre|\/registration|\/hub\/registration/i.test(finalUrl)) {
+    return `auth redirect to ${finalUrl}`;
+  }
+  if (text && /ingres[áa]\s+a\s+tu\s+cuenta|necesit[áa]s?\s+iniciar\s+sesi[óo]n|tu\s+sesi[óo]n\s+expir[óo]/i.test(text)) {
+    return 'page demands login';
+  }
+  return null;
+}
+
 // Visit one MercadoLibre listing's detail page and pull the structured
 // "Principales" feature table. The values are rendered as LABEL\nVALUE inside
 // `document.body.innerText`, so we extract by line-pairs after JS hydration.
 export async function enrichDetail(url) {
   const ctx = await newContext();
+  // Lingering close: on success keep the tab open 10-15s before closing, to
+  // mimic a human glancing at the listing. On failure close immediately.
+  let extractedOk = false;
   try {
     // Reset ML cookies to the known-good set from ml-cookies.txt before EVERY
     // detail navigation. ML's first response sets bot-detection cookies that
@@ -224,44 +259,56 @@ export async function enrichDetail(url) {
     const { refreshMlCookies } = await import('../browser.js');
     await refreshMlCookies(ctx._underlying);
     const page = await ctx.newPage();
-    // `domcontentloaded` instead of `load`: ML's load event waits on every
-    // tracker, ad pixel, and lazy image — sometimes 20+s. The structured
-    // feature table renders during the SPA hydrate which fires before load.
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    // `commit` fires as soon as ML's first HTTP response arrives (~1s on a
+    // healthy session). `domcontentloaded` is unreliable here — ML streams
+    // the Polycard layout progressively and DCL can be delayed by minutes
+    // behind their anti-fraud JS. We poll body.innerText below to know when
+    // the structured fields have rendered, instead of waiting on the event.
+    const resp = await page.goto(url, { waitUntil: 'commit', timeout: 20_000 });
     if (resp && (resp.status() === 404 || resp.status() === 410)) {
       const { ListingGoneError } = await import('./base.js');
       throw new ListingGoneError(`http ${resp.status()}`, resp.status());
     }
     const finalUrl = page.url();
+    const authFailUrl = detectAuthFailure(finalUrl, '');
+    if (authFailUrl) {
+      throw new MercadoLibreAuthError(`${authFailUrl} — cookies likely expired, refresh data/ml-cookies.txt`);
+    }
     if (
       /\/gz\/|account-verification|\/captcha/i.test(finalUrl) ||
       /\/gz\//i.test(url) === false && finalUrl !== url && !finalUrl.includes('MLA-')
     ) {
       throw new MercadoLibreBlockedError(`anti-bot redirect to ${finalUrl}`);
     }
-    // Wait for the features section to render (h2 like "Características",
-    // table cells containing m²/ambientes, or the price block). Returns as
-    // soon as ANY of them appears — typically 1-3s instead of fixed 5s.
-    await page
-      .waitForSelector(
-        'h2:has-text("Caracter"), table.andes-table, [class*="ui-pdp-features"], [class*="ui-pdp-price"]',
-        { timeout: 8_000 },
-      )
-      .catch(() => null);
-    // Try to click "Ver todas las características" if present, but don't
-    // wait long — the data we need is usually in the first feature panel
-    // already, so this is best-effort and shouldn't block the parse.
-    try {
-      const btn = page.locator('button:has-text("Ver todas")').first();
-      if (await btn.count()) {
-        await btn.click({ timeout: 1_000 }).catch(() => {});
-        await page.waitForTimeout(400);
-      }
-    } catch {
-      // ignore
+    // Poll body.innerText every 200ms until either the structured markers
+    // we'll parse are visible, or 10s elapses. Bailing as soon as the data
+    // is there saves several seconds per listing vs. waiting on a static
+    // selector that breaks when ML tweaks classnames.
+    const READY_RE = /superficie\s+(total|cubierta)|m²\s+totales?|\bambientes?\b|antig[üu]edad/i;
+    let text = '';
+    const readyDeadline = Date.now() + 10_000;
+    while (Date.now() < readyDeadline) {
+      text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
+      if (text && READY_RE.test(text)) break;
+      await page.waitForTimeout(200);
     }
-    const text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+    // Fallback: click "Ver todas las características" if the markers never
+    // showed up (some listings hide them behind that toggle).
+    if (!text || !READY_RE.test(text)) {
+      try {
+        const btn = page.locator('button:has-text("Ver todas")').first();
+        if (await btn.count()) {
+          await btn.click({ timeout: 1_000 }).catch(() => {});
+          await page.waitForTimeout(400);
+          text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
+        }
+      } catch { /* ignore */ }
+    }
     if (!text) return null;
+    const authFailText = detectAuthFailure(finalUrl, text);
+    if (authFailText) {
+      throw new MercadoLibreAuthError(`${authFailText} — cookies likely expired, refresh data/ml-cookies.txt`);
+    }
     // Listings whose publisher closed them ("Publicación finalizada" or
     // "Publicación pausada") still respond 200 with a simplified detail page.
     // Our DB still has them active=1 from the last scrape. Mark them gone so
@@ -315,7 +362,7 @@ export async function enrichDetail(url) {
     let amb = num(seen['ambientes']);
     const dorm = num(seen['dormitorios']);
     const ban = num(seen['baños']);
-    const coch = num(seen['cocheras']);
+    let coch = num(seen['cocheras']);
     let ant = num(seen['antigüedad']);
     const piso = seen['número de piso de la unidad'];
     // Fallback: some ML pages (especially finalized/paused listings, or new
@@ -333,6 +380,15 @@ export async function enrichDetail(url) {
     if (!amb) {
       const m = text.match(/(\d+)\s+ambientes?/i);
       if (m) amb = Number(m[1]);
+    }
+    // ML's label/value pair-walker misses "Cocheras: 0" when label and value
+    // share a line. Without this the seller's explicit "0 cocheras" gets lost
+    // and enrich.js falls back to body-text detection (which sees "cochera"
+    // in amenity copy and flips the flag to 1). Use == null so a real 0 from
+    // the pair-walker isn't overwritten.
+    if (coch == null) {
+      const m = text.match(/\bcocheras?\s*[:\s]\s*(\d+)\b/i);
+      if (m) coch = Number(m[1]);
     }
     if (ant == null) {
       // Look for "Antigüedad" near a number — must be the structured label,
@@ -363,9 +419,39 @@ export async function enrichDetail(url) {
     if (piso) out.floor = String(piso).match(/\d+|pb/i)?.[0] || null;
     if (text) out.description = text.slice(0, 6000);
     if (detectedOperation) out.operation = detectedOperation;
+    // Address — ML's detail page shows the canonical address in two places:
+    //   1) Subtitle right below the title (e.g. "Av. Cabildo 4667 4° C, Capital Federal")
+    //   2) "Ubicación e información de la zona" section with the full
+    //      "STREET ALTURA [4° C], BARRIO, Capital Federal" line.
+    // The detail-page address is way more reliable than the card's
+    // `neighborhood_raw` (which sellers sometimes pollute with title text).
+    // We prefer the "Ubicación" line when present because it includes the
+    // barrio; fall back to a generic "..., Capital Federal" match.
+    let mlAddress = null;
+    const ubMatch = text.match(/Ubicaci[oó]n\s+e\s+informaci[oó]n\s+de\s+la\s+zona[\s\S]{0,200}?\n+\s*([^\n]+?,\s*[^\n]+?,\s*Capital Federal)\b/i);
+    if (ubMatch) {
+      mlAddress = ubMatch[1].replace(/\s*,\s*Capital Federal\s*,\s*Capital Federal\s*$/i, ', Capital Federal').trim();
+    }
+    if (!mlAddress) {
+      // Fallback: any "STREET ALTURA, BARRIO, Capital Federal" line. Strict
+      // pattern (starts with a capital, has a number, ends with ", Capital
+      // Federal") so we don't grab fragments from descriptions.
+      const lineMatch = text.match(/^[ \t]*([A-ZÁÉÍÓÚÑ][^\n,]{2,60}\s+\d{2,5}(?:\s+\d+°?\s*[A-Z]?)?,\s*[^\n,]+,\s*Capital Federal)\s*$/m);
+      if (lineMatch) mlAddress = lineMatch[1].trim();
+    }
+    if (mlAddress) out.address = mlAddress;
+    extractedOk = true;
     return out;
   } finally {
-    await ctx.close().catch(() => {});
+    if (extractedOk) {
+      // Lingering close: keep the tab open 10-15s before closing. Doesn't
+      // block the caller (setTimeout not awaited) — the listing data returns
+      // immediately, the tab close just happens later in the background.
+      const linger = 10_000 + Math.random() * 5_000;
+      setTimeout(() => { ctx.close().catch(() => {}); }, linger);
+    } else {
+      await ctx.close().catch(() => {});
+    }
   }
 }
 
@@ -433,6 +519,10 @@ export async function* iterateListings(neighborhood, operation, _opts = {}) {
       try {
         raws = await fetchPage(neighborhood, operation, offset, order.suffix);
       } catch (err) {
+        // Auth errors are unrecoverable without a manual cookie refresh —
+        // propagate so the orchestrator stops the entire ML scrape instead of
+        // walking through every ordering producing nothing.
+        if (err.name === 'MercadoLibreAuthError') throw err;
         logger.warn(
           { err: err.message, offset, order: order.id, neighborhood: neighborhood.id },
           'mercadolibre fetch failed',

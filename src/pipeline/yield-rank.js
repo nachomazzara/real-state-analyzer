@@ -5,7 +5,7 @@ const SELECT_VENTAS = `
 SELECT id, source, external_id, url, neighborhood, neighborhood_raw, rooms, bedrooms, bathrooms,
        covered_m2, uncovered_m2, total_m2, homogenized_m2, age_years, age_band,
        has_pool, has_amenities, has_garage, floor, amenities_json,
-       price, currency, price_usd, status, delivery_year
+       price, currency, price_usd, status, delivery_year, sub_zone
 FROM listings
 WHERE operation = 'venta' AND neighborhood IN ({{ph}}) AND active = 1
   AND price_usd > 0 AND homogenized_m2 > 0
@@ -44,6 +44,17 @@ export function rankProperties({
     let build_yield_pct = null;
     let rent_estimate_usd = null;
     let rent_source = null;
+    let rent_rate_per_m2 = null;
+    let rent_match_level = null;
+    let rent_sub_zone_label = null;
+    // Sub-zone anchored alternative (filled only when the primary cascade
+    // landed on neighborhood/fallback; lets the UI show a "your zone" line
+    // next to the barrio estimate).
+    let rent_subzone_alt_usd = null;
+    let rent_subzone_alt_rate = null;
+    let rent_subzone_alt_label = null;
+    let rent_subzone_alt_scope = null;
+    let rent_subzone_alt_n = null;
     let ref_usd_per_m2 = null;
     let build_ref_source = null;
 
@@ -51,6 +62,16 @@ export function rankProperties({
       const rent = estimateRent(r);
       rent_estimate_usd = rent.estimateUsd;
       rent_source = rent.source;
+      rent_rate_per_m2 = rent.ratePerM2;
+      rent_match_level = rent.matchLevel;
+      rent_sub_zone_label = rent.subZoneLabel;
+      if (rent.subzoneAlt) {
+        rent_subzone_alt_usd = rent.subzoneAlt.estimateUsd;
+        rent_subzone_alt_rate = rent.subzoneAlt.ratePerM2;
+        rent_subzone_alt_label = rent.subzoneAlt.subZoneLabel;
+        rent_subzone_alt_scope = rent.subzoneAlt.scope;
+        rent_subzone_alt_n = rent.subzoneAlt.n;
+      }
       rental_yield_pct = (rent.estimateUsd * 12) / r.price_usd;
       if (rental_yield_pct < minYield) continue;
     } else {
@@ -94,7 +115,15 @@ export function rankProperties({
       rental_yield_pct: round4(rental_yield_pct),
       build_yield_pct: round4(build_yield_pct),
       rent_estimate_usd: round2(rent_estimate_usd),
+      rent_rate_per_m2: round2(rent_rate_per_m2),
       rent_source,
+      rent_match_level,
+      rent_sub_zone_label,
+      rent_subzone_alt_usd: round2(rent_subzone_alt_usd),
+      rent_subzone_alt_rate: round2(rent_subzone_alt_rate),
+      rent_subzone_alt_label,
+      rent_subzone_alt_scope,
+      rent_subzone_alt_n,
       ref_usd_per_m2: round2(ref_usd_per_m2),
       build_ref_source,
       score: round4(score),

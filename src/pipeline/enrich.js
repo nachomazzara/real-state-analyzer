@@ -1,4 +1,5 @@
 import pLimit from 'p-limit';
+import { config } from '../config.js';
 import { getDb } from '../db.js';
 import { logger } from '../logger.js';
 import { homogenize, ageBand } from './homogenize.js';
@@ -72,6 +73,10 @@ const UPDATE_ENRICHED = `
     age_years = COALESCE(?, age_years),
     age_band = COALESCE(?, age_band),
     floor = COALESCE(?, floor),
+    address = COALESCE(?, address),
+    lat = COALESCE(?, lat),
+    lng = COALESCE(?, lng),
+    sub_zone = COALESCE(?, sub_zone),
     last_seen_at = ?
   WHERE id = ?
 `;
@@ -190,30 +195,26 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
       total: totalCount,
     });
   }
-  // Process listings concurrently per source. MercadoLibre is special: a
-  // bot-detection wall trips when too many detail requests come from the
-  // same IP in quick succession, so we throttle ML to a single in-flight
-  // request and pause between them.
-  // Start with 2 concurrent ML fetches and a short delay. If ML behaves we
-  // can raise this in .env via ML_ENRICH_CONCURRENCY without code changes.
-  const ML_CONCURRENCY = Number(process.env.ML_ENRICH_CONCURRENCY) || 8;
-  // No throttle by default: refreshMlCookies() resets the session before each
-  // navigation so ML can't link rapid-fire requests to a single bot session.
-  // Throttle was protective when we shared cookies across requests.
-  const ML_INTER_REQUEST_MS = Number(process.env.ML_ENRICH_DELAY_MS) || 0;
-  // Zonaprop sits behind Cloudflare Turnstile. Parallel detail-page hits
-  // trigger fresh challenges that don't resolve without user interaction —
-  // so 1 concurrent + a delay between requests is the sweet spot. Anything
-  // that still gets walled falls through to the agent.
+  // ML cadence is "channel-based": ML_CHANNELS independent worker streams
+  // run in parallel. Each channel processes its share of listings
+  // sequentially: navigate → extract → wait ML_DELAY (jittered 2-5s) →
+  // next. This mimics a human who keeps a small handful of tabs in flight
+  // continuously rather than firing strict pair-bursts. Faster than the
+  // old burst-of-2 design while still looking organic (~3 active tabs at
+  // any moment + jittered inter-request spacing per channel).
+  const ML_CHANNELS = Number(process.env.ML_CHANNELS) || 3;
+  const ML_DELAY_MIN_MS = Number(process.env.ML_DELAY_MIN_MS) || 2_000;
+  const ML_DELAY_MAX_MS = Number(process.env.ML_DELAY_MAX_MS) || 5_000;
+  // Zonaprop sits behind Cloudflare Turnstile. Detail-page navigation clears
+  // cookies per request (zonaprop.js:310) so Cloudflare sees each request as
+  // a fresh session — that makes throttling unnecessary by default. Set
+  // ZONAPROP_ENRICH_DELAY_MIN/MAX_MS only if a wall flares up under load.
   const ZP_CONCURRENCY = Number(process.env.ZONAPROP_ENRICH_CONCURRENCY) || 5;
-  // Inter-request delay for zonaprop. Defaults to 0 now that we clear
-  // cookies before every detail-page navigation — Cloudflare treats each
-  // request as a fresh session, so throttling between them serves no
-  // purpose. Set higher only if a wall flares up again under load.
-  const ZP_INTER_REQUEST_MS = Number(process.env.ZONAPROP_ENRICH_DELAY_MS) || 0;
+  const ZP_DELAY_MIN_MS = Number(process.env.ZONAPROP_ENRICH_DELAY_MIN_MS) || 0;
+  const ZP_DELAY_MAX_MS = Number(process.env.ZONAPROP_ENRICH_DELAY_MAX_MS) || 0;
   const defaultPerSource = Number(process.env.ENRICH_CONCURRENCY) || 5;
   const perSource =
-    source === 'mercadolibre' ? ML_CONCURRENCY
+    source === 'mercadolibre' ? ML_CHANNELS
     : source === 'zonaprop' ? ZP_CONCURRENCY
     : defaultPerSource;
   // Direct-fetch gate: throttled for ML so we don't trip the bot wall.
@@ -223,48 +224,67 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
   // big pending lists. Default 6; tunable via env.
   const AGENT_CONCURRENCY = Number(process.env.AGENT_CONCURRENCY) || 6;
   const agentGate = pLimit(AGENT_CONCURRENCY);
-  // Proper serialization for ML: each concurrent waiter grabs the NEXT
-  // available slot (now + delay since the previous slot). Without this,
-  // 2 concurrent tasks would both see `lastRequestAt`, compute the same
-  // wait, and fire in a burst — which is exactly what trips the wall.
+  // Per-request streaming throttle (used by Zonaprop only — ML is batched
+  // below). Multiple concurrent waiters serialize via nextSlotMs so they
+  // don't all read it as "now" and fire in a burst.
   let nextSlotMs = 0;
-  // Per-request inter-arrival delay. Set per source so we throttle ML and
-  // Zonaprop (Cloudflare) but let argenprop/remax run as fast as the gate
-  // allows.
-  const interRequestDelay =
-    source === 'mercadolibre' ? ML_INTER_REQUEST_MS
-    : source === 'zonaprop' ? ZP_INTER_REQUEST_MS
-    : 0;
+  const [delayMinMs, delayMaxMs] =
+    source === 'zonaprop' ? [ZP_DELAY_MIN_MS, ZP_DELAY_MAX_MS]
+    : [0, 0];
   async function throttleIfMl() {
-    if (interRequestDelay <= 0) return;
+    if (delayMaxMs <= 0) return;
+    const delay = delayMinMs + Math.random() * (delayMaxMs - delayMinMs);
     const now = Date.now();
     const myTurn = Math.max(nextSlotMs, now);
-    nextSlotMs = myTurn + interRequestDelay;
+    nextSlotMs = myTurn + delay;
     const wait = myTurn - now;
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
   }
-  const MAX_ATTEMPTS = 3;
+  // ML: 1 attempt — retries multiply time spent and rarely rescue listings
+  // that failed on first try (the failures are usually structural template
+  // issues, not transient network blips). Other sources: 3 attempts as before.
+  const MAX_ATTEMPTS = source === 'mercadolibre' ? 1 : 3;
   const RETRY_DELAY_MS = 10_000;
+  // Hard ceiling per listing so one slow page can't stall a Promise.all batch.
+  // ML: 45s (30s nav + 3s ready poll + small margin). Others: 90s to give
+  // the agent fallback time to run.
+  const LISTING_TIMEOUT_MS = source === 'mercadolibre' ? 45_000 : 90_000;
   // ML walls are handled per-listing via the agent fallback (WebFetch).
-  // No circuit breaker any more.
-  const tasks = rows.map((r) =>
-    (async () => {
+  // Auth failures are different: once ML signals "no session / cookies invalid"
+  // it stays that way for the whole run, so we flip a sticky breaker and skip
+  // every remaining listing instead of burning hours retrying each 3 times.
+  let mlAuthBroken = false;
+  async function processOne(r) {
+      // ML auth already known broken from a previous task in this run? Skip
+      // immediately — burning through 2000 more listings each retrying 3x
+      // accomplishes nothing without fresh cookies.
+      if (source === 'mercadolibre' && mlAuthBroken) {
+        failed++;
+        emitProgress();
+        return;
+      }
       // Mark the attempt before we even start so a crash mid-task doesn't
       // leave the listing in an "always pending" state.
       db.prepare(MARK_ATTEMPTED).run(Date.now(), r.id);
       try {
-        // Phase 1 — direct fetch under the throttled directGate. Returns
-        // either { extra } when something useful was extracted, { walled }
-        // when ML's wall rejected us (skip to agent), { gone } when 404/410.
-        // Counters are incremented INSIDE the gate so they reflect tasks
-        // doing real work, not the 974 IIFEs queued behind it.
-        const directResult = await directGate(async () => {
+        // Phase 1 — direct fetch. Non-ML sources go through the throttled
+        // directGate (pLimit). ML bypasses the gate entirely: concurrency is
+        // already controlled by the batch loop (Promise.all of ML_BURST_SIZE
+        // listings), and using pLimit here is actively harmful — if a per-
+        // listing deadline fires in processOneWithDeadline, the inner enricher
+        // promise keeps running orphaned and HOLDS the pLimit slot. That makes
+        // every subsequent batch queue forever behind those zombie slots.
+        const runDirect = source === 'mercadolibre' ? (fn) => fn() : directGate;
+        const directResult = await runDirect(async () => {
           started++;
           inFlight++;
           emitProgress();
           try {
             let extra = null;
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+              // Late check: another task in flight may have just tripped the
+              // breaker while we were waiting on the gate.
+              if (source === 'mercadolibre' && mlAuthBroken) return { authBroken: true };
               try {
                 await throttleIfMl();
                 extra = await enricher(r.url);
@@ -272,6 +292,19 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
                 if (err.name === 'ListingGoneError') {
                   db.prepare('UPDATE listings SET active = 0 WHERE id = ?').run(r.id);
                   return { gone: true };
+                }
+                if (err.name === 'MercadoLibreAuthError') {
+                  // Sticky breaker: first task to see this trips it; everyone
+                  // else queued behind sees it and short-circuits. Logged
+                  // once with a clear remediation message.
+                  if (!mlAuthBroken) {
+                    mlAuthBroken = true;
+                    logger.error(
+                      { err: err.message, source, neighborhood },
+                      'MercadoLibre auth failed — stopping ML enrichment for this run. Refresh data/ml-cookies.txt and re-run.',
+                    );
+                  }
+                  return { authBroken: true };
                 }
                 if (err.name === 'MercadoLibreBlockedError' || err.name === 'CloudflareWalledError') {
                   // Direct fetch is hopeless on these — bot wall blocking us
@@ -309,12 +342,29 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
           emitProgress();
           return;
         }
+        if (directResult.authBroken) {
+          // Auth is dead for this run — don't escalate to agent (the agent
+          // can't supply user-session-gated data) and don't retry.
+          failed++;
+          emitProgress();
+          return;
+        }
         let extra = directResult.extra || null;
         // Phase 2 — agent escalation on its own gate (higher concurrency,
         // different IP). Runs when the direct fetch couldn't recover the
         // missing fields OR when ML's wall blocked the direct attempt.
+        //
+        // MercadoLibre is excluded by default: WebFetch hits ML with no
+        // cookies and gets HTTP 403 every time; the Bash render fallback in
+        // the agent skill assumes a `/app/scripts/render-page.js` path that
+        // only exists in the Docker image, not on macOS. End result: every
+        // ML agent call runs out the 5-minute timeout, holding agentGate
+        // slots and stalling the pipeline. Override with ML_USE_AGENT=true
+        // if you've configured a working agent path.
+        const ML_USE_AGENT = /^(1|true|yes|on)$/i.test(String(process.env.ML_USE_AGENT || ''));
+        const sourceUsesAgent = source === 'mercadolibre' ? ML_USE_AGENT : true;
         const needsAgent =
-          useAgentFallback && (!extra || (extra.covered_m2 == null && extra.age_years == null));
+          useAgentFallback && sourceUsesAgent && (!extra || (extra.covered_m2 == null && extra.age_years == null));
         if (needsAgent) {
           await agentGate(async () => {
             agentInFlight++;
@@ -386,7 +436,10 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
         // When the detail page exposes the label, trust it; otherwise leave
         // the existing flag alone.
         const descLower = (extra.description || '').toLowerCase();
-        const detailHasPoolBody = /pileta|piscina/.test(descLower) ? 1 : 0;
+        // Pool detection — exclude false positives where "pileta" is the
+        // kitchen/laundry sink ("pileta de acero inoxidable", "pileta de
+        // cocina", "pileta de servicio"), not a swimming pool.
+        const detailHasPoolBody = /(?:^|[^a-záéíóúñ])piscina|(?:^|[^a-záéíóúñ])pileta(?!\s+de\s+(?:acero|cocina|granito|servicio|lavar|lavadero|lavarropas|inox))/i.test(descLower) ? 1 : 0;
         const detailHasAmenitiesBody = /amenit|gimnasio|laundry|seguridad|\bsum\b|parrilla|solarium|spa\b/.test(descLower) ? 1 : 0;
         // Floor: prefer the scraper's structured value if it returned one,
         // otherwise mine the description for "segundo piso", "Piso 5", "PB"
@@ -403,10 +456,38 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
         let finalGarage;
         if (extra.parking != null) {
           finalGarage = extra.parking > 0 ? 1 : 0;
-        } else if (/\bcochera|\bgarage|\bgaraje|estacionamiento/.test(descLower)) {
-          finalGarage = 1;
         } else {
-          finalGarage = r.has_garage ?? 0;
+          // Negatives: phrases that mention "cochera" but DON'T mean the
+          // unit has one.
+          //  - Site-wide footer boilerplate (argenprop): "...PH, cocheras y
+          //    más en Argenprop".
+          //  - Parking sold separately (zonaprop): "Cocheras disponibles a
+          //    partir de $40.000", "cochera opcional", "cochera aparte".
+          //  - Explicit "sin cochera" / "no incluye cochera".
+          //  - The listing itself is a cochera for sale/rent.
+          // Argenprop's site-wide footer literally ends with "...cocheras y
+          // más en Argenprop." — require that full phrase so we don't risk
+          // killing real positive mentions of "cocheras".
+          const garageNeg = (
+            /\bcocheras\s+y\s+m[áa]s\s+en\s+argenprop\b/.test(descLower) ||
+            // Allow 0-2 intermediate adjectives between "cochera(s)" and the
+            // negative qualifier: catches "cocheras FIJAS disponibles" /
+            // "cochera CUBIERTA opcional" / "cocheras descubiertas a partir de…"
+            /\bcocheras?(?:\s+\w+){0,3}\s+(?:disponibles?|opcional(?:es)?|a\s+partir|aparte|por\s+separado|extra|con\s+costo)\b/.test(descLower) ||
+            // Plural "cocheras fijas" alone means the building has fixed
+            // garage spots SOLD SEPARATELY — not included with the unit. The
+            // unit-included variant uses the singular: "cochera fija".
+            /\bcocheras\s+fijas\b/.test(descLower) ||
+            /\bsin\s+cochera\b/.test(descLower) ||
+            /\bno\s+(?:incluye|tiene)\s+cochera\b/.test(descLower) ||
+            /\b(?:alquila|alquiler|venta|vende|vendo|en\s+venta)\b[^.]{0,30}\bcochera\b/.test(descLower) ||
+            /\bcochera\b[^.]{0,30}\b(?:en\s+venta|en\s+alquiler|en\s+oferta)\b/.test(descLower)
+          );
+          if (!garageNeg && /\bcochera|\bgarage|\bgaraje|\bestacionamiento/.test(descLower)) {
+            finalGarage = 1;
+          } else {
+            finalGarage = r.has_garage ?? 0;
+          }
         }
         // Pool / amenities: no equivalent structured label exists on most
         // detail pages, so we add signal from description text but never
@@ -427,6 +508,22 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
             'enrich: reclassified operation from detail-page breadcrumb',
           );
         }
+        // When the scraper supplied lat/lng directly (e.g. argenprop's
+        // leaflet container data-attrs), compute sub_zone here too so the
+        // listing skips the background geocoder entirely.
+        let extraLat = null;
+        let extraLng = null;
+        let extraSubzone = null;
+        if (Number.isFinite(extra.lat) && Number.isFinite(extra.lng)) {
+          extraLat = extra.lat;
+          extraLng = extra.lng;
+          if (config.enableSubzones) {
+            try {
+              const { computeSubZone } = await import('./subzone.js');
+              extraSubzone = computeSubZone(extra.lat, extra.lng);
+            } catch (e) { /* ignore — sub_zone is optional */ }
+          }
+        }
         db.prepare(UPDATE_ENRICHED).run(
           extra.covered_m2 ?? null,
           merged.uncovered_m2 ?? null,
@@ -441,6 +538,10 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
           extra.age_years ?? null,
           band,
           floorFinal,
+          extra.address ?? null,
+          extraLat,
+          extraLng,
+          extraSubzone,
           Date.now(),
           r.id,
         );
@@ -503,9 +604,67 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
         failed++;
         emitProgress();
       }
-    })(),
-  );
-  await Promise.all(tasks);
+  }
+  // Hard timeout wrapper: a single slow URL must not be allowed to stall the
+  // batch Promise.all (which only resolves when its slowest leg completes).
+  async function processOneWithDeadline(r) {
+    let timer;
+    try {
+      await Promise.race([
+        processOne(r),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`listing timeout ${LISTING_TIMEOUT_MS}ms`)),
+            LISTING_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (err) {
+      if (err && err.message && err.message.startsWith('listing timeout')) {
+        logger.warn(
+          { listingId: r.id, url: r.url, timeoutMs: LISTING_TIMEOUT_MS },
+          'enrich: per-listing deadline exceeded — skipping',
+        );
+        failed++;
+        emitProgress();
+        return;
+      }
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  if (source === 'mercadolibre') {
+    // Channel dispatch: ML_CHANNELS independent worker streams process
+    // their share of rows sequentially. Each channel runs:
+    //   navigate → extract → wait 2-5s (jittered) → next listing
+    // 3 channels in parallel ⇒ ~3 active tabs at any moment, each one
+    // pacing itself between requests. Looks like a human keeping 3 ML
+    // tabs open and ctrl-clicking the next listing every couple seconds.
+    const channels = Array.from({ length: ML_CHANNELS }, () => []);
+    rows.forEach((r, i) => channels[i % ML_CHANNELS].push(r));
+    await Promise.all(channels.map(async (channelRows, channelIdx) => {
+      for (let i = 0; i < channelRows.length; i++) {
+        if (mlAuthBroken) {
+          for (let j = i; j < channelRows.length; j++) { failed++; emitProgress(); }
+          return;
+        }
+        await processOneWithDeadline(channelRows[i]);
+        if (i + 1 < channelRows.length && !mlAuthBroken) {
+          const delay = ML_DELAY_MIN_MS + Math.random() * (ML_DELAY_MAX_MS - ML_DELAY_MIN_MS);
+          logger.debug(
+            { source, channel: channelIdx, done: i + 1, total: channelRows.length, delayMs: Math.round(delay) },
+            'enrich: ml channel pause',
+          );
+          await new Promise((res) => setTimeout(res, delay));
+        }
+      }
+    }));
+  } else {
+    // Other sources: streaming dispatch — all tasks queue behind the pLimit
+    // directGate, which throttles per-source. Matches the prior behavior.
+    await Promise.all(rows.map(processOneWithDeadline));
+  }
   if (onProgress) {
     onProgress({
       phase: 'enrich',
@@ -523,7 +682,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
     });
   }
   logger.info(
-    { source, neighborhood, enriched, failed, healed, gone, candidates: totalCount, concurrency: perSource },
+    { source, neighborhood, enriched, failed, healed, gone, candidates: totalCount, concurrency: perSource, delayMinMs, delayMaxMs },
     'enrichment done',
   );
   return { enriched, failed, healed, gone, candidates: totalCount };

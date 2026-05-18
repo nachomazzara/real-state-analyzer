@@ -189,6 +189,83 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .hidden { display: none; }
 
+/* Sub-zones (beta) chip panel — sits at the top of each neighborhood block. */
+.subzone-panel:empty { display: none; }
+.subzone-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 6px 0 14px;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.subzone-title {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 4px;
+}
+.chip-subzone {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+.chip-subzone:hover { border-color: var(--accent, var(--warn)); }
+.chip-subzone.active {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.chip-count {
+  color: var(--muted);
+  font-size: 11px;
+}
+.subzone-chips.empty em { color: var(--muted); font-size: 12px; font-style: italic; }
+.subzone-progress {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 8px 2px;
+}
+.subzone-progress:empty { display: none; }
+
+/* Background-enrich progress banner shown while the scrape job is already
+   complete but enrichment keeps filling in detail-page fields. */
+.enrich-status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border: 1px dashed var(--warn);
+  border-radius: 8px;
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.enrich-status-bar b { color: var(--text, inherit); }
+.btn-small {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn-small:hover { color: var(--warn); border-color: var(--warn); }
+.enrich-fresh { color: var(--muted); font-size: 11px; margin-left: 6px; }
+
 #job-progress .row-progress {
   display: grid;
   grid-template-columns: 140px 110px 90px 1fr;

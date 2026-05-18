@@ -12,6 +12,7 @@ import { propertiesRoute } from './routes/properties.js';
 import { neighborhoodsRoute } from './routes/neighborhoods.js';
 import { sourcesRoute } from './routes/sources.js';
 import { analysesRoute } from './routes/analyses.js';
+import { resumePendingGeocoding } from './pipeline/orchestrator.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,4 +52,10 @@ getDb();
 
 app.listen(config.port, () => {
   logger.info({ port: config.port }, 'real-state-analyzer listening');
+  // Resume any pending geocoding work left over from a previous run (or from
+  // a one-shot SQL backfill). No-op when ENABLE_SUBZONES is off or when no
+  // listings have addresses without lat/lng.
+  resumePendingGeocoding().catch((err) => {
+    logger.warn({ err: err.message }, 'resumePendingGeocoding failed');
+  });
 });

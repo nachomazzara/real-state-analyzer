@@ -128,7 +128,8 @@ function toListing(raw, neighborhood, operation) {
   const feats = parseFeatureBlob(raw.featBlob);
 
   const blob = ((raw.cardText || '') + ' ' + (raw.featBlob || '')).toLowerCase();
-  const has_pool = /pileta|piscina/.test(blob);
+  // Exclude false positives like "pileta de acero inoxidable" (kitchen sink).
+  const has_pool = /(?:^|[^a-záéíóúñ])piscina|(?:^|[^a-záéíóúñ])pileta(?!\s+de\s+(?:acero|cocina|granito|servicio|lavar|lavadero|lavarropas|inox))/i.test(blob);
   // Trust the structured "N coch" signal from the feature blob.
   const has_garage = feats.parking != null && feats.parking > 0;
   const has_amenities = /amenit|gimnasio|laundry|seguridad|sum\b/.test(blob);
@@ -218,6 +219,17 @@ export async function enrichDetail(url) {
     if ((m = text.match(/Cocheras\s*:\s*(\d+)/i))) out.parking = Number(m[1]);
     if ((m = text.match(/Antig[üu]edad\s*:\s*(\d+)\s*años?/i))) out.age_years = Number(m[1]);
     if (out.age_years == null && /Antig[üu]edad\s*:\s*a\s*estrenar/i.test(text)) out.age_years = 0;
+    // Address — Remax's "Ubicación" section on the detail page has the
+    // canonical "STREET ALTURA, BARRIO, Capital Federal" line, much more
+    // reliable than the card's bare "STREET ALTURA" we used to fall back to.
+    const addrM = text.match(/Ubicaci[oó]n\s*\n+\s*([^\n]+?,\s*[^\n]+?,\s*(?:Capital Federal|Buenos Aires|CABA))\b/i);
+    if (addrM) {
+      out.address = addrM[1].trim();
+    } else {
+      // Looser fallback: any "STREET ALTURA, BARRIO, Capital Federal" line.
+      const addrM2 = text.match(/([A-ZÁÉÍÓÚÑa-záéíóúñ][^,\n]{2,60}\s+\d{2,5}),\s*([^,\n]+),\s*(Capital Federal|Buenos Aires|CABA)\b/);
+      if (addrM2) out.address = addrM2[0].trim();
+    }
     return out;
   } finally {
     await ctx.close().catch(() => {});

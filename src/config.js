@@ -6,6 +6,11 @@ const num = (v, d) => {
   return Number.isFinite(n) && n > 0 ? n : d;
 };
 
+const bool = (v, d) => {
+  if (v == null || v === '') return d;
+  return /^(1|true|yes|on)$/i.test(String(v));
+};
+
 // Resolve data dir: env wins (Docker sets DATA_DIR=/app/data), otherwise
 // fall back to a `./data` folder next to the package root so `node src/server.js`
 // from a clone works out of the box.
@@ -30,4 +35,9 @@ export const config = {
   // Valid values: oficial, blue, bolsa, contadoconliqui, mayorista, cripto, tarjeta.
   // Default 'oficial' per user preference; change in .env to swap.
   fxRateType: (process.env.FX_RATE_TYPE || 'oficial').toLowerCase(),
+  // Sub-zonas v2: extract address, geocode, bucket via H3. Off by default —
+  // turn on with ENABLE_SUBZONES=true to opt into the new pipeline phase, the
+  // new endpoints, and the new UI tab. Everything is additive and reversible.
+  enableSubzones: bool(process.env.ENABLE_SUBZONES, false),
+  geocodeBatchLimit: num(process.env.GEOCODE_BATCH_LIMIT, 500),
 };

@@ -99,7 +99,8 @@ function toListing(raw, neighborhood, operation) {
 
   const blob = ((raw.description || '') + ' ' + (raw.address || '') + ' ' + (raw.features || ''))
     .toLowerCase();
-  const has_pool = /pileta|piscina/.test(blob);
+  // Exclude false positives like "pileta de acero inoxidable" (kitchen sink).
+  const has_pool = /(?:^|[^a-záéíóúñ])piscina|(?:^|[^a-záéíóúñ])pileta(?!\s+de\s+(?:acero|cocina|granito|servicio|lavar|lavadero|lavarropas|inox))/i.test(blob);
   // Trust the structured "N coch." token from the features list; that's the
   // only place Zonaprop tells us the UNIT (not the building) has parking.
   const has_garage = feats.parking != null && feats.parking > 0;
@@ -388,7 +389,91 @@ export async function enrichDetail(url) {
     if ((m = blob.match(/(\d+)\s*años?\s*(?:de\s+antig)?/))) out.age_years = Number(m[1]);
     if (/a\s*estrenar/.test(blob) && out.age_years == null) out.age_years = 0;
     if (description) out.description = description.slice(0, 6000);
+    // Address: zonaprop detail pages render the street+altura near a map-pin
+    // icon. Try a dedicated selector first, fall back to a regex on the full
+    // page text matching the canonical CABA pattern "<street> <number>, <barrio>,
+    // Capital Federal".
+    try {
+      // Zonaprop's address container has class `section-location` but the tag
+      // varies (was h4, now h2/div in some layouts) — don't pin the tag.
+      // The `*="postingAddress"` is the older variant from card view; some
+      // listings keep that on detail page too.
+      const addrEl = await p.$('[class*="section-location"], [class*="map-address"], [data-qa*="location-address"], [class*="postingAddress"]');
+      if (addrEl) {
+        const t = (await addrEl.textContent())?.trim();
+        if (t) out.address = t;
+      }
+    } catch { /* ignore selector miss */ }
+    if (!out.address && description) {
+      const am = description.match(/([A-ZÁÉÍÓÚÑ][^\n,]{2,60}\s+\d{2,5}),\s*([^\n,]+),\s*(Capital Federal|Buenos Aires|CABA)/);
+      if (am) out.address = am[0].trim();
+    }
     return out;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
+// Map-coord fallback: when the text geocoder can't resolve a listing's
+// address, open the detail page in Playwright and read coords straight from
+// the map widget. Zonaprop pre-renders a static map image (no coords in the
+// URL), but clicking `#article-map` triggers Google Maps to mount inside
+// `#react-map-modal` and emit anchor tags like
+//   `https://maps.google.com/maps?ll=-34.54147,-58.473704&...`
+//   `https://www.google.com/maps/@-34.5414698,-58.4737037,16z/...`
+// Both contain the listing's exact lat/lng. Returns `{lat, lng}` or null.
+export async function fetchMapCoords(url) {
+  const ctx = await newContext();
+  try {
+    await ctx._underlying.clearCookies({ domain: '.zonaprop.com.ar' }).catch(() => {});
+    await ctx._underlying.clearCookies({ domain: 'zonaprop.com.ar' }).catch(() => {});
+    const p = await ctx.newPage();
+    const fullUrl = url.startsWith('http') ? url : BASE + url;
+    const referer = (() => {
+      try { const u = new URL(fullUrl); return `${u.origin}/`; } catch { return BASE + '/'; }
+    })();
+    const resp = await p.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45_000, referer });
+    if (resp && (resp.status() === 404 || resp.status() === 410)) {
+      const { ListingGoneError } = await import('./base.js');
+      throw new ListingGoneError(`http ${resp.status()}`, resp.status());
+    }
+    // Wait for the feature list (same Cloudflare-clear signal enrichDetail uses).
+    await p.waitForSelector('.section-icon-features, [class*="icon-feature"]', { timeout: 20_000 }).catch(() => {});
+    // Scroll the map into view (lazy-mount) then click. The static map image
+    // and the article-map container both forward to the same modal trigger.
+    await p.evaluate(() => {
+      const el = document.querySelector('#article-map') || document.querySelector('#static-map');
+      if (el) el.scrollIntoView({ behavior: 'instant', block: 'center' });
+    });
+    await new Promise((r) => setTimeout(r, 1200));
+    await p.click('#article-map', { timeout: 4000 }).catch(async () => {
+      await p.click('#static-map', { timeout: 4000 }).catch(() => {});
+    });
+    // Google Maps tile + anchor hydration takes ~2-4s after the click.
+    await new Promise((r) => setTimeout(r, 4000));
+    const coords = await p.evaluate(() => {
+      // Prefer the explicit Google Maps URL params (most reliable).
+      for (const a of document.querySelectorAll('a[href*="google.com/maps"], a[href*="maps.google"]')) {
+        const href = a.href || '';
+        let m = href.match(/[?&]ll=(-?\d+\.\d+),(-?\d+\.\d+)/);
+        if (m) return { lat: Number(m[1]), lng: Number(m[2]) };
+        m = href.match(/\/maps\/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+        if (m) return { lat: Number(m[1]), lng: Number(m[2]) };
+      }
+      // Fallback: scan the full document HTML for a -34.x, -58.x pair
+      // (CABA latitude/longitude range). Skip any pair that's outside.
+      const html = document.documentElement.outerHTML;
+      const pairs = [...html.matchAll(/(-34\.\d{3,8})[^a-zA-Z\d\-]{1,5}(-58\.\d{3,8})/g)];
+      for (const m of pairs) {
+        const lat = Number(m[1]);
+        const lng = Number(m[2]);
+        if (lat >= -34.71 && lat <= -34.53 && lng >= -58.55 && lng <= -58.33) {
+          return { lat, lng };
+        }
+      }
+      return null;
+    });
+    return coords;
   } finally {
     await ctx.close().catch(() => {});
   }
