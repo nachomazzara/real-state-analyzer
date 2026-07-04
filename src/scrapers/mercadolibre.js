@@ -247,24 +247,73 @@ function detectAuthFailure(finalUrl, text) {
 // "Principales" feature table. The values are rendered as LABEL\nVALUE inside
 // `document.body.innerText`, so we extract by line-pairs after JS hydration.
 export async function enrichDetail(url) {
+  // Fast-skip "alquiler temporario" / "vacacional" listings. ML uses a
+  // different detail-page template for short-term rentals (no covered_m2,
+  // rooms or antiguedad — they sell on "guests", "amenities", etc), so our
+  // READY_RE never matches and the listing burns the full 45s deadline
+  // before being marked failed. Mark them as gone so they drop out of the
+  // pending pool entirely instead of being retried every run.
+  if (/alquiler[-_]temporario|vacacional|airbnb/i.test(url)) {
+    const { ListingGoneError } = await import('./base.js');
+    throw new ListingGoneError('skipped: alquiler temporario template (no structured fields)');
+  }
   const ctx = await newContext();
-  // Lingering close: on success keep the tab open 10-15s before closing, to
-  // mimic a human glancing at the listing. On failure close immediately.
-  let extractedOk = false;
+  // Close the tab IMMEDIATELY in `finally`, no lingering. The previous
+  // design kept the tab open 10-15s after success to mimic a human
+  // "reading" the listing, but that was actively harmful: ML's anti-fraud
+  // JS (DataDome / snoopy / etc) kept running and could trigger a delayed
+  // refresh-challenge on a tab we already harvested. The 8-25s pause
+  // *between* listings (controlled by ML_DELAY_MIN/MAX_MS in enrich.js)
+  // already provides the human rhythm — and crucially we're idle during it,
+  // not exposed to ML.
   try {
-    // Reset ML cookies to the known-good set from ml-cookies.txt before EVERY
-    // detail navigation. ML's first response sets bot-detection cookies that
-    // taint the session — subsequent requests get walled. Same pattern we use
-    // for zonaprop. Each request starts with a clean, authenticated session.
-    const { refreshMlCookies } = await import('../browser.js');
-    await refreshMlCookies(ctx._underlying);
+    // NOTE: deliberately NOT calling refreshMlCookies here anymore. The old
+    // design wiped ML cookies before each detail nav under the theory that
+    // ML's first response sets bot-detection cookies that "taint" the
+    // session. But in practice the OPPOSITE happens: real users accumulate
+    // those cookies as they browse — wiping them flags us as "someone who
+    // never visited ML before but is suddenly hitting detail pages directly",
+    // which is exactly the bot signature ML's anti-fraud looks for. The
+    // cookies loaded once on browser startup (loadManualCookies) plus
+    // whatever ML adds organically during normal browsing is the right
+    // shape. Only reset if cookies are genuinely empty (first run).
     const page = await ctx.newPage();
     // `commit` fires as soon as ML's first HTTP response arrives (~1s on a
     // healthy session). `domcontentloaded` is unreliable here — ML streams
     // the Polycard layout progressively and DCL can be delayed by minutes
     // behind their anti-fraud JS. We poll body.innerText below to know when
     // the structured fields have rendered, instead of waiting on the event.
-    const resp = await page.goto(url, { waitUntil: 'commit', timeout: 20_000 });
+    // Refresh-loop detector: when ML's anti-bot serves a challenge page that
+    // auto-reloads (meta refresh, JS redirect, DataDome), the same URL fires
+    // 'framenavigated' repeatedly. Track navigations; if we see ≥3 inside
+    // 5s on the same page, bail with MercadoLibreBlockedError immediately
+    // instead of waiting the 45s per-listing deadline. Visual symptom in the
+    // Chrome tab: rapid blinking / continuous reload.
+    let navCount = 0;
+    let navFirstAt = Date.now();
+    let refreshLoopDetected = false;
+    const onNav = () => {
+      const now = Date.now();
+      if (now - navFirstAt > 5_000) { navCount = 0; navFirstAt = now; }
+      navCount++;
+      if (navCount >= 3) refreshLoopDetected = true;
+    };
+    page.on('framenavigated', onNav);
+    // Referer header: when a human clicks a card on a listings page, the
+    // browser sends `Referer: https://departamento.mercadolibre.com.ar/...`
+    // along with the navigation. Without it, ML's anti-fraud sees a
+    // "naked" detail-page hit (no provenance) and immediately serves a
+    // challenge / refresh-loop. Synthesize a plausible Referer from the
+    // URL's own origin — looks like "I just came from the ML site".
+    const referer = (() => {
+      try { return new URL(url).origin + '/'; }
+      catch { return 'https://www.mercadolibre.com.ar/'; }
+    })();
+    const resp = await page.goto(url, {
+      waitUntil: 'commit',
+      timeout: 20_000,
+      referer,
+    });
     if (resp && (resp.status() === 404 || resp.status() === 410)) {
       const { ListingGoneError } = await import('./base.js');
       throw new ListingGoneError(`http ${resp.status()}`, resp.status());
@@ -288,22 +337,28 @@ export async function enrichDetail(url) {
     let text = '';
     const readyDeadline = Date.now() + 10_000;
     while (Date.now() < readyDeadline) {
+      if (refreshLoopDetected) {
+        throw new MercadoLibreBlockedError(`refresh-loop detected on ${page.url()} — ML serving anti-bot challenge`);
+      }
       text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
       if (text && READY_RE.test(text)) break;
       await page.waitForTimeout(200);
     }
-    // Fallback: click "Ver todas las características" if the markers never
-    // showed up (some listings hide them behind that toggle).
-    if (!text || !READY_RE.test(text)) {
-      try {
-        const btn = page.locator('button:has-text("Ver todas")').first();
-        if (await btn.count()) {
-          await btn.click({ timeout: 1_000 }).catch(() => {});
-          await page.waitForTimeout(400);
-          text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
-        }
-      } catch { /* ignore */ }
-    }
+    // ALWAYS expand "Ver todas las características" when present, even if the
+    // initial text already matched READY_RE. The new ML layout puts only the
+    // top-level facts (ambientes, m², dormitorios) above the fold and hides
+    // cocheras / antigüedad / piso / orientación behind that toggle. The
+    // initial READY_RE check was sneaking past it, leaving antigüedad blank
+    // on listings that visibly have it on screen. Click is cheap (~400ms) and
+    // a no-op when the section is already expanded.
+    try {
+      const btn = page.locator('button:has-text("Ver todas")').first();
+      if (await btn.count()) {
+        await btn.click({ timeout: 1_000 }).catch(() => {});
+        await page.waitForTimeout(400);
+        text = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => text);
+      }
+    } catch { /* ignore — fall back to whatever text we have */ }
     if (!text) return null;
     const authFailText = detectAuthFailure(finalUrl, text);
     if (authFailText) {
@@ -330,6 +385,11 @@ export async function enrichDetail(url) {
     // Walk pairs: a label followed by its value on the next line. Take the
     // FIRST occurrence of each label so a later section header with the same
     // word doesn't override it (e.g. "Ambientes" section header).
+    //
+    // Two formats coexist in ML's HTML, depending on the page layout version:
+    //   (A) two lines:   "Antigüedad\n51 años"     — captured by the pair walk
+    //   (B) one line:    "Antigüedad: 51 años"     — captured by the regex pass
+    // We do both passes so either layout populates `seen` uniformly.
     const seen = {};
     for (let i = 0; i < lines.length - 1; i++) {
       const label = lines[i];
@@ -338,6 +398,16 @@ export async function enrichDetail(url) {
       const key = label.toLowerCase();
       if (seen[key] != null) continue;
       seen[key] = value;
+    }
+    // Same-line "Label: value" pass for the new "Características del inmueble"
+    // section. Restrict the label side to <= 50 chars and disallow digits in
+    // it so a stray "USD 295.000:..." copy line doesn't bleed in.
+    for (const ln of lines) {
+      const m = ln.match(/^([^\d:][^:]{0,49})\s*:\s*(.+?)\s*$/);
+      if (!m) continue;
+      const key = m[1].toLowerCase().trim();
+      if (!key || seen[key] != null) continue;
+      seen[key] = m[2].trim();
     }
     function num(v) {
       if (v == null) return null;
@@ -440,18 +510,12 @@ export async function enrichDetail(url) {
       if (lineMatch) mlAddress = lineMatch[1].trim();
     }
     if (mlAddress) out.address = mlAddress;
-    extractedOk = true;
     return out;
   } finally {
-    if (extractedOk) {
-      // Lingering close: keep the tab open 10-15s before closing. Doesn't
-      // block the caller (setTimeout not awaited) — the listing data returns
-      // immediately, the tab close just happens later in the background.
-      const linger = 10_000 + Math.random() * 5_000;
-      setTimeout(() => { ctx.close().catch(() => {}); }, linger);
-    } else {
-      await ctx.close().catch(() => {});
-    }
+    // Close immediately, every path — success, failure, or thrown error.
+    // No setTimeout-based linger: that left the tab open while ML's
+    // anti-fraud JS continued probing.
+    await ctx.close().catch(() => {});
   }
 }
 

@@ -5,7 +5,14 @@ import { createTargetedJob, createEnrichPendingJob } from '../jobs.js';
 
 export const sourcesRoute = Router();
 
-const SOURCES = ['mercadolibre', 'argenprop', 'remax', 'zonaprop'];
+// MercadoLibre is intentionally OUT of this list. ML's anti-bot fingerprints
+// the Playwright-launched Chrome and walls ~90% of requests; the only
+// reliable path is to attach via CDP to the user's own Chrome, which needs
+// manual setup (relaunch with --remote-debugging-port=9222). That's
+// incompatible with one-click UI flows, so ML lives in `scripts/scrape-ml.js`
+// — see HOW_TO_SCRAP_ML.md. ML listings already in the DB stay visible in
+// stats/ranking; we just stop offering "refresh" / "enrich" buttons for them.
+const SOURCES = ['argenprop', 'remax', 'zonaprop'];
 const OPERATIONS = ['venta', 'alquiler'];
 
 sourcesRoute.get('/', (req, res) => {
@@ -102,14 +109,31 @@ sourcesRoute.get('/', (req, res) => {
   res.json({ sources: out });
 });
 
+// Same allow-list as SOURCES above. ML is rejected by both POST endpoints
+// below because it's CLI-only — see HOW_TO_SCRAP_ML.md.
 const RefreshBody = z.object({
-  source: z.enum(['mercadolibre', 'argenprop', 'remax', 'zonaprop']),
+  source: z.enum(['argenprop', 'remax', 'zonaprop']),
   neighborhood: z.string().min(1),
   operation: z.enum(['venta', 'alquiler']),
   mode: z.enum(['full', 'incremental']).optional(),
 });
 
+// Explicit ML rejection. zod's enum mismatch would also reject it, but with
+// a generic "invalid_body" message — this gives the caller (and any human
+// hitting the endpoint directly) the actionable pointer.
+function rejectIfML(req, res) {
+  if (req.body?.source === 'mercadolibre') {
+    res.status(400).json({
+      error: 'ml_handled_via_cli',
+      message: 'MercadoLibre is no longer triggered from the UI. See HOW_TO_SCRAP_ML.md and run `node --env-file=.env scripts/scrape-ml.js <analysis-id>` instead.',
+    });
+    return true;
+  }
+  return false;
+}
+
 sourcesRoute.post('/refresh', (req, res) => {
+  if (rejectIfML(req, res)) return;
   const parsed = RefreshBody.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'invalid_body', issues: parsed.error.issues });
@@ -119,7 +143,7 @@ sourcesRoute.post('/refresh', (req, res) => {
 });
 
 const EnrichPendingBody = z.object({
-  source: z.enum(['mercadolibre', 'argenprop', 'remax', 'zonaprop']),
+  source: z.enum(['argenprop', 'remax', 'zonaprop']),
   neighborhood: z.string().min(1),
   force: z.boolean().optional().default(true),
 });
@@ -163,6 +187,7 @@ sourcesRoute.get('/pending-listings', (req, res) => {
 });
 
 sourcesRoute.post('/enrich-pending', (req, res) => {
+  if (rejectIfML(req, res)) return;
   const parsed = EnrichPendingBody.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'invalid_body', issues: parsed.error.issues });

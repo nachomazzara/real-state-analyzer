@@ -1,14 +1,19 @@
 :root {
-  --bg: #0f1115;
-  --panel: #181b22;
-  --panel-2: #20242d;
-  --border: #2a2f3a;
-  --text: #e8ecf2;
-  --muted: #98a0ad;
-  --accent: #4dd0e1;
-  --good: #5ed27a;
-  --warn: #f6c453;
-  --bad: #ef6f6f;
+  /* Warm editorial palette — cream paper background, lighter cream cards,
+     deep navy accent. The cream-on-cream gives the cards visible "lift"
+     without resorting to harsh white-on-gray contrast. Inspired by
+     financial dailies (Economist, FT) rather than dev tools. */
+  --bg: #e8e3d7;        /* warm cream paper — the page background */
+  --panel: #f7f3eb;     /* lighter cream — cards "lift" off the bg */
+  --panel-2: #ddd8c9;   /* a touch darker than bg — inputs, subtle fills */
+  --border: #c6bfb1;    /* warm gray-beige hairlines, visible without shouting */
+  --text: #1c1a17;      /* warm near-black */
+  --muted: #6f6a5e;     /* warm stone for labels / secondary text */
+  --accent: #1e3a5f;    /* deep navy — sober, editorial; not Claude teal */
+  --accent-soft: #e3e8f0; /* light navy tint — for hover/highlight surfaces */
+  --good: #166534;      /* green-800 */
+  --warn: #9a3412;      /* orange-800 — warm, fits the cream palette */
+  --bad:  #7f1d1d;      /* red-900 — deep, restrained */
 }
 
 * { box-sizing: border-box; }
@@ -99,7 +104,7 @@ button {
   margin-top: 12px;
   padding: 10px 16px;
   background: var(--accent);
-  color: #0c1014;
+  color: #ffffff;
   border: 0;
   border-radius: 6px;
   font-weight: 600;
@@ -124,7 +129,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   max-height: 280px;
   overflow-y: auto;
   z-index: 30;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
 }
 .suggestions[hidden] {
   display: none;
@@ -340,10 +345,10 @@ th, td {
   line-height: 1.4;
 }
 tbody tr:nth-child(odd) td {
-  background: rgba(255, 255, 255, 0.015);
+  background: #f0ebde; /* warm-zebra: a touch darker than --panel cream */
 }
 tbody tr:hover td {
-  background: rgba(77, 208, 225, 0.05);
+  background: var(--accent-soft); /* soft navy tint matches deep navy accent */
 }
 th { color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; text-align: center; }
 td.num { text-align: center; font-variant-numeric: tabular-nums; }
@@ -353,7 +358,11 @@ td a:hover { text-decoration: underline; }
 
 .matrix {
   display: grid;
-  grid-template-columns: 110px repeat(5, 1fr);
+  /* Column count is driven by the JS — it sets --matrix-cols to the number
+     of bucket columns (5 for rooms, 9 for size). Without this, a matrix
+     wider than 5 buckets wraps to the next grid row and the header/row-
+     labels bleed into data cells. */
+  grid-template-columns: 110px repeat(var(--matrix-cols, 5), minmax(0, 1fr));
   gap: 2px;
   margin-top: 8px;
 }
@@ -414,7 +423,7 @@ td a:hover { text-decoration: underline; }
 .filter-chip:hover { border-color: var(--accent); }
 .filter-chip.active {
   background: var(--accent);
-  color: #0c1014;
+  color: #ffffff;
   border-color: var(--accent);
 }
 .ranking-toolbar input[type="number"],
@@ -568,10 +577,28 @@ button.secondary:hover {
   color: var(--accent);
 }
 
+/* In-cell info trigger (the ℹ️ next to a matrix value). Without this it
+   inherits the default primary `button` style and shows up as a giant
+   accent-colored block in every cell, drowning the actual data. */
+.btn-info-cell {
+  margin: 0 0 0 4px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  vertical-align: middle;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+.btn-info-cell:hover { opacity: 1; }
+
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(15, 23, 42, 0.45); /* slate-900 @ 45% — soft, not pitch black */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -587,7 +614,7 @@ button.secondary:hover {
   max-height: 90vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 48px rgba(15, 23, 42, 0.18);
 }
 .modal-header {
   display: flex;
@@ -642,4 +669,296 @@ button.secondary:hover {
 .modal-table a code {
   font-size: 11px;
   color: var(--accent);
+}
+
+/* =====================================================================
+   Ranking map view (Tabla / Mapa toggle + Leaflet container + markers).
+   ===================================================================== */
+
+.view-toggle {
+  display: inline-flex;
+  margin: 8px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.view-tab {
+  margin: 0;
+  padding: 6px 14px;
+  background: var(--panel);
+  color: var(--muted);
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.view-tab:last-child { border-right: 0; }
+.view-tab.active {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+#ranking-map {
+  height: 640px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+#ranking-map.hidden { display: none; }
+
+/* Price-pill marker — Leaflet treats this as a DivIcon, so we own the
+   layout. The pill is anchored at the bottom-center (where the .map-pin
+   little triangle sits) so the visual point coincides with the
+   coordinate. */
+.price-marker {
+  background: transparent !important;
+  border: 0 !important;
+}
+.price-marker-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.25);
+  border: 1.5px solid #ffffff;
+  cursor: pointer;
+  /* Positioning is handled by Leaflet's iconAnchor now — no CSS transform.
+     Removing the old `translate(-50%, -100%)` fixed the click hitbox
+     mismatch. */
+}
+/* Pin de propiedad ya vista — keep the yield color background so the
+   user still reads "is this a good deal?", but swap the white border for
+   the classic "visited link" violet. Feels intuitively like a link that
+   was clicked. Combined with the ✓ prefix the JS injects and a subtle
+   inner glow, unmistakable at a glance. */
+.price-marker-pill.viewed {
+  border-color: #7c3aed; /* violet-600 — "visited link" vibe */
+  box-shadow:
+    0 2px 6px rgba(15, 23, 42, 0.25),
+    0 0 0 2px rgba(124, 58, 237, 0.18); /* soft violet halo */
+  font-weight: 500;
+}
+
+/* Hover tooltip — same white pill look as the popup used to have. Full
+   listing detail so the user can compare pins side by side without
+   clicking. Click on the marker opens the actual listing in a new tab. */
+.leaflet-tooltip.map-hover-tip {
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.18);
+  max-width: 400px;
+  min-width: 260px;
+  white-space: normal;
+  opacity: 1;
+}
+.leaflet-tooltip.map-hover-tip::before { border-top-color: #ffffff; }
+.map-hover-price {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+.map-hover-line {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+.map-hover-addr {
+  color: var(--text);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.map-hover-hint {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+/* Popup styling — Leaflet's `.leaflet-popup-content-wrapper` defaults to
+   a white pill, which works for us in light mode. Override font + spacing
+   for visual consistency with the rest of the UI. */
+.leaflet-popup-content {
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  margin: 10px 12px;
+}
+.map-popup-price {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.map-popup-line {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.map-popup-addr {
+  color: var(--text);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.map-popup-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 500;
+}
+.map-popup-link:hover { text-decoration: underline; }
+
+/* =====================================================================
+   Analysis ID + copyable CLI command snippet (run-analysis.js workflow).
+   Shown in the current-analysis bar and the recent-analyses cards.
+   ===================================================================== */
+
+.analysis-id-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.analysis-id-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.analysis-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--text);
+  user-select: all; /* triple-click selects the whole UUID */
+}
+.analysis-id-small {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted);
+  user-select: all;
+}
+.btn-copy,
+.btn-copy-small {
+  margin: 0;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.btn-copy-small {
+  padding: 1px 5px;
+  font-size: 10px;
+}
+.btn-copy:hover,
+.btn-copy-small:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* =====================================================================
+   Analysis tabs (multi-selection). The "Análisis activo" bar can hold
+   several analyses; each is a tab the user can switch between. The
+   ranking + map merge across all tabs; per-analysis blocks (stats +
+   sources) show the active tab only.
+   ===================================================================== */
+
+.analysis-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.analysis-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 10px 6px 12px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.analysis-tab:hover { border-color: var(--accent); }
+.analysis-tab.active {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+.analysis-tab-label {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.analysis-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  font-weight: 700;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+}
+.analysis-tab-close:hover {
+  opacity: 1;
+  background: rgba(239, 68, 68, 0.25);
+}
+.analysis-tab.active .analysis-tab-close { color: rgba(255,255,255,0.85); }
+.analysis-merged-note {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.analysis-active-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+/* Highlight a recent-analyses card that's currently in the selection. */
+.analysis-card-selected {
+  border-color: var(--accent) !important;
+  box-shadow: inset 3px 0 0 var(--accent);
 }

@@ -35,6 +35,45 @@ const ENRICHERS = Object.fromEntries(
 // when the source simply doesn't expose the missing fields. Re-attempt after
 // ENRICH_RETRY_AFTER_MS (default 24h).
 const ENRICH_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+
+// Translate raw enrich errors (or our own "no useful data" verdicts) into a
+// short, human-readable category so the script can show the user WHY a
+// listing failed instead of just an opaque count. Keep the set small — a
+// handful of well-named buckets > a long tail of one-off messages.
+//
+//   auth          MercadoLibre redirected to /login or page demanded login.
+//                 Means cookies / session are dead.
+//   blocked       Anti-bot wall (refresh-loop, MercadoLibreBlockedError,
+//                 CloudflareWalledError). The page never settled.
+//   timeout       Per-listing 45s deadline expired (LISTING_TIMEOUT_MS in
+//                 the channel loop). Usually means the page was hanging in
+//                 a partial-load state.
+//   transient     Playwright/browser race ("Target page, context or browser
+//                 has been closed", "Navigation interrupted"). One-off,
+//                 retryable on the next pass.
+//   no_data       Page loaded fine but the parser couldn't extract any of
+//                 covered_m2 / age_years. The listing genuinely lacks those
+//                 fields in the source. Re-attempting won't help.
+//   network       fetch / DNS / TLS layer error.
+//   other         Unmatched.
+export function categorizeError(err, hint) {
+  // Explicit hint overrides — for failures that aren't carrying a real Error
+  // object ("no_data" = page parsed empty, "auth"/"aborted" = drained queue
+  // after a breaker tripped). Saves the regex roulette below.
+  if (hint && ['no_data', 'auth', 'aborted', 'blocked', 'timeout', 'transient'].includes(hint)) {
+    return hint;
+  }
+  const name = err?.name || '';
+  const msg = (err?.message || hint || '').toLowerCase();
+  if (name === 'MercadoLibreAuthError' || /cookies likely expired|page demands login|auth redirect/.test(msg)) return 'auth';
+  if (name === 'MercadoLibreBlockedError' || name === 'CloudflareWalledError') return 'blocked';
+  if (/refresh-loop|anti-bot|datadome|captcha/.test(msg)) return 'blocked';
+  if (/listing timeout|deadline exceeded|navigation timeout/.test(msg)) return 'timeout';
+  if (/target page, context or browser has been closed|page closed|context closed|frame was detached/.test(msg)) return 'transient';
+  if (/net::|getaddrinfo|econnreset|enotfound|connect timeout/.test(msg)) return 'network';
+  return 'other';
+}
+
 const SELECT_INCOMPLETE_BASE = `
   SELECT id, source, url, operation, status, price, currency, price_usd,
          covered_m2, uncovered_m2, total_m2, age_years, rooms, delivery_year,
@@ -160,6 +199,24 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
   let started = 0;
   let inFlight = 0;
   let agentInFlight = 0;
+  // Tally of why listings failed (category → count). Emitted on every
+  // progress event so the script can show a real-time breakdown like
+  // `fail=12 (refresh_loop:7 timeout:3 no_data:2)` instead of just a
+  // total count. Helps the user spot patterns mid-run ("ML walled us"
+  // vs "this barrio has crappy listings").
+  const failBuckets = Object.create(null);
+  // The categorized reason for the MOST RECENT failure. Useful for the
+  // script's per-listing log line so the user sees WHY each listing
+  // failed as soon as it happens.
+  let lastFailure = null;
+  function recordFailure(err, hint) {
+    const category = categorizeError(err, hint);
+    failBuckets[category] = (failBuckets[category] || 0) + 1;
+    lastFailure = {
+      category,
+      message: err?.message ? String(err.message).slice(0, 180) : (hint || category),
+    };
+  }
   const totalCount = rows.length;
   if (onProgress) {
     onProgress({ phase: 'enrich', source, neighborhood, status: 'starting', total: totalCount });
@@ -193,6 +250,13 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
       in_flight: inFlight,
       agent_in_flight: agentInFlight,
       total: totalCount,
+      // Categorized failure visibility. `failBuckets` is the running tally
+      // (auth/blocked/timeout/no_data/…); `lastFailure` carries the most
+      // recent error so the script can show a one-liner reason per fail.
+      // Both default to safe empty shapes for non-ML sources (no failures
+      // recorded → empty buckets).
+      fail_buckets: { ...failBuckets },
+      last_failure: lastFailure,
     });
   }
   // ML cadence is "channel-based": ML_CHANNELS independent worker streams
@@ -205,6 +269,14 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
   const ML_CHANNELS = Number(process.env.ML_CHANNELS) || 3;
   const ML_DELAY_MIN_MS = Number(process.env.ML_DELAY_MIN_MS) || 2_000;
   const ML_DELAY_MAX_MS = Number(process.env.ML_DELAY_MAX_MS) || 5_000;
+  // "Long break" cadence — every ML_BREAK_EVERY listings on a channel, pause
+  // for ML_BREAK_MIN..MAX ms. Mimics a human stepping away (lunch, coffee,
+  // bathroom). Defaults are off (0 = disabled) so the server's standard
+  // streaming behavior is unchanged; the CLI script run-analysis.js sets
+  // them to 30 listings / 60-180s for CI / cron use.
+  const ML_BREAK_EVERY = Number(process.env.ML_BREAK_EVERY) || 0;
+  const ML_BREAK_MIN_MS = Number(process.env.ML_BREAK_MIN_MS) || 60_000;
+  const ML_BREAK_MAX_MS = Number(process.env.ML_BREAK_MAX_MS) || 180_000;
   // Zonaprop sits behind Cloudflare Turnstile. Detail-page navigation clears
   // cookies per request (zonaprop.js:310) so Cloudflare sees each request as
   // a fresh session — that makes throttling unnecessary by default. Set
@@ -259,6 +331,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
       // immediately — burning through 2000 more listings each retrying 3x
       // accomplishes nothing without fresh cookies.
       if (source === 'mercadolibre' && mlAuthBroken) {
+        recordFailure(null, 'auth');
         failed++;
         emitProgress();
         return;
@@ -345,6 +418,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
         if (directResult.authBroken) {
           // Auth is dead for this run — don't escalate to agent (the agent
           // can't supply user-session-gated data) and don't retry.
+          recordFailure(null, 'auth');
           failed++;
           emitProgress();
           return;
@@ -386,6 +460,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
           });
         }
         if (!extra || (extra.covered_m2 == null && extra.age_years == null)) {
+          recordFailure(null, 'no_data');
           failed++;
           emitProgress();
           return;
@@ -601,6 +676,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
         emitProgress();
       } catch (err) {
         logger.warn({ err: err.message, listingId: r.id, url: r.url }, 'enrich detail failed');
+        recordFailure(err);
         failed++;
         emitProgress();
       }
@@ -625,6 +701,7 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
           { listingId: r.id, url: r.url, timeoutMs: LISTING_TIMEOUT_MS },
           'enrich: per-listing deadline exceeded — skipping',
         );
+        recordFailure(err, 'timeout');
         failed++;
         emitProgress();
         return;
@@ -634,6 +711,10 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
       if (timer) clearTimeout(timer);
     }
   }
+  // Sticky flag — set by either the auth breaker or the consecutive-failure
+  // abort. Declared at function scope so the return value can surface it.
+  let mlAborted = false;
+  let mlAbortReason = null;
   if (source === 'mercadolibre') {
     // Channel dispatch: ML_CHANNELS independent worker streams process
     // their share of rows sequentially. Each channel runs:
@@ -641,22 +722,70 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
     // 3 channels in parallel ⇒ ~3 active tabs at any moment, each one
     // pacing itself between requests. Looks like a human keeping 3 ML
     // tabs open and ctrl-clicking the next listing every couple seconds.
+    //
+    // Consecutive-failure abort: when ML flags the session/fingerprint
+    // every listing fails the same way (refresh-loop, empty body, etc).
+    // No point burning 2 hours confirming — after N consecutive failures
+    // we throw and let the caller surface a clear "session blown, fix
+    // the Chrome" message to the user. Default 5; set
+    // ML_ABORT_AFTER_CONSECUTIVE_FAILS=0 to disable.
+    const ABORT_AFTER = Number.isFinite(Number(process.env.ML_ABORT_AFTER_CONSECUTIVE_FAILS))
+      ? Number(process.env.ML_ABORT_AFTER_CONSECUTIVE_FAILS)
+      : 5;
+    let consecutiveFailures = 0;
     const channels = Array.from({ length: ML_CHANNELS }, () => []);
     rows.forEach((r, i) => channels[i % ML_CHANNELS].push(r));
     await Promise.all(channels.map(async (channelRows, channelIdx) => {
       for (let i = 0; i < channelRows.length; i++) {
-        if (mlAuthBroken) {
-          for (let j = i; j < channelRows.length; j++) { failed++; emitProgress(); }
+        if (mlAuthBroken || mlAborted) {
+          for (let j = i; j < channelRows.length; j++) {
+            recordFailure(null, mlAuthBroken ? 'auth' : 'aborted');
+            failed++; emitProgress();
+          }
           return;
         }
+        const beforeFailed = failed;
+        const beforeEnriched = enriched;
         await processOneWithDeadline(channelRows[i]);
-        if (i + 1 < channelRows.length && !mlAuthBroken) {
+        if (enriched > beforeEnriched) consecutiveFailures = 0;
+        else if (failed > beforeFailed) consecutiveFailures++;
+        if (ABORT_AFTER > 0 && consecutiveFailures >= ABORT_AFTER && !mlAborted) {
+          mlAborted = true;
+          mlAbortReason = `${consecutiveFailures} consecutive failures (threshold=${ABORT_AFTER}) — likely session/fingerprint flagged by ML`;
+          logger.error(
+            { source, channel: channelIdx, consecutiveFailures, threshold: ABORT_AFTER, done: i + 1, total: channelRows.length },
+            'enrich: ML aborting — too many consecutive failures (likely session/fingerprint flagged by ML)',
+          );
+          // Drain remaining queue fast (same pattern as mlAuthBroken) so the
+          // outer Promise.all resolves and the caller sees the counts.
+          for (let j = i + 1; j < channelRows.length; j++) {
+            recordFailure(null, 'aborted');
+            failed++; emitProgress();
+          }
+          return;
+        }
+        if (i + 1 < channelRows.length && !mlAuthBroken && !mlAborted) {
+          // Regular jittered pause between listings (default 2-5s,
+          // CLI bumps to 8-25s).
           const delay = ML_DELAY_MIN_MS + Math.random() * (ML_DELAY_MAX_MS - ML_DELAY_MIN_MS);
           logger.debug(
             { source, channel: channelIdx, done: i + 1, total: channelRows.length, delayMs: Math.round(delay) },
             'enrich: ml channel pause',
           );
           await new Promise((res) => setTimeout(res, delay));
+          // Long break every N listings on this channel — simulates a
+          // human stepping away. Disabled by default (server flow keeps
+          // streaming); CLI sets ML_BREAK_EVERY=30 so a ~hour-long run
+          // gets 2-3 idle gaps that match a real person's browsing
+          // session.
+          if (ML_BREAK_EVERY > 0 && (i + 1) % ML_BREAK_EVERY === 0) {
+            const breakMs = ML_BREAK_MIN_MS + Math.random() * (ML_BREAK_MAX_MS - ML_BREAK_MIN_MS);
+            logger.info(
+              { source, channel: channelIdx, done: i + 1, total: channelRows.length, breakMs: Math.round(breakMs) },
+              'enrich: ml long break (mimicking human idle gap)',
+            );
+            await new Promise((res) => setTimeout(res, breakMs));
+          }
         }
       }
     }));
@@ -679,21 +808,45 @@ export async function enrichListingsForSource({ source, neighborhood, limit = 10
       in_flight: 0,
       agent_in_flight: 0,
       total: totalCount,
+      fail_buckets: { ...failBuckets },
+      last_failure: lastFailure,
     });
   }
   logger.info(
     { source, neighborhood, enriched, failed, healed, gone, candidates: totalCount, concurrency: perSource, delayMinMs, delayMaxMs },
     'enrichment done',
   );
-  return { enriched, failed, healed, gone, candidates: totalCount };
+  return {
+    enriched,
+    failed,
+    healed,
+    gone,
+    candidates: totalCount,
+    // Signals from the ML-specific abort logic. Non-ML sources always have
+    // these falsy. The standalone script (scripts/scrape-ml.js) inspects
+    // these to decide whether to print the "session blown" banner.
+    aborted: mlAborted || mlAuthBroken,
+    abortReason: mlAbortReason || (mlAuthBroken ? 'MercadoLibreAuthError — cookies/session invalid' : null),
+    // Final tally of why listings failed, useful for the end-of-run summary
+    // ("23 fails: refresh_loop:14 timeout:6 no_data:3").
+    failBuckets: { ...failBuckets },
+  };
 }
+
+// Sources excluded from the post-scrape enrich pass triggered by the UI.
+// MercadoLibre needs CDP-attach to a user-launched Chrome (see
+// HOW_TO_SCRAP_ML.md); the standalone script `scripts/scrape-ml.js` calls
+// `enrichListingsForSource({source: 'mercadolibre'})` directly with the
+// right environment, bypassing this filter.
+const UI_EXCLUDED_SOURCES = new Set(['mercadolibre']);
 
 export async function enrichAfterScrape(neighborhood, { onProgress, limitPerSource = 10000, force = false } = {}) {
   // Run all sources concurrently. Each enricher uses Playwright (separate
   // browser contexts) or HTTP (no shared state), so there's no cross-source
-  // contention. With per-source concurrency of 5 and 4 sources, total
-  // in-flight detail fetches = 20 — comfortably within Playwright + Mac M4.
-  const sources = Object.keys(ENRICHERS);
+  // contention. With per-source concurrency of 5 and 3 sources (ML is
+  // excluded — handled by `scripts/scrape-ml.js`), total in-flight detail
+  // fetches = 15 — comfortably within Playwright + Mac M4.
+  const sources = Object.keys(ENRICHERS).filter((s) => !UI_EXCLUDED_SOURCES.has(s));
   const entries = await Promise.all(
     sources.map(async (source) => {
       try {

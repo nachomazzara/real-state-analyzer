@@ -1,35 +1,75 @@
 # real-state-analyzer
 
-Property analyzer for CABA / GBA Norte (Zonaprop, ArgenProp, Remax, MercadoLibre).
-Computes USD/m² by neighborhood, room count, amenities and age, and ranks properties by yield.
+Property analyzer for CABA / GBA Norte. Aggregates listings from **ArgenProp,
+Remax, Zonaprop** (via the UI) and **MercadoLibre** (via a standalone CLI —
+see [HOW_TO_SCRAP_ML.md](HOW_TO_SCRAP_ML.md)). Computes USD/m² by
+neighborhood, room count, amenities and age, and ranks properties by yield.
+Includes a searchable, filterable ranking table and an interactive map view
+with per-listing markers coloured by yield.
 
-## Run
+## Quick start
 
-```
+```bash
+# 1. Clone + enter the repo, then create your .env (used for CLI runs; the
+#    Docker container also reads it as a fallback).
+cp .env.example .env
+# Edit .env — set CLAUDE_CODE_OAUTH_TOKEN if you're on macOS (see below).
+
+# 2. Boot everything.
 docker compose up --build
+
+# 3. Open http://localhost:3000 in your browser.
+#    - Type a barrio in the search box (e.g. "núñez") + press Enter.
+#    - Set filters (min yield, ambientes, cochera, etc), click "Analizar".
+#    - Watch the job progress, then browse the ranking + map views.
 ```
 
-Then open [http://localhost:3000](http://localhost:3000).
+The SQLite database lives at `./data/analyzer.db` (mounted as a Docker
+volume — survives container rebuilds). All scraped listings, cursors,
+geocodes and saved analyses persist there.
 
-The SQLite database lives at `./data/analyzer.db` (mounted as a volume).
+### Prerequisites
+
+- **Docker + docker compose** (Docker Desktop or equivalent).
+- **Node 20+** on the host — needed only if you plan to run the CLI
+  scripts directly (see below). The web UI + Docker workflow doesn't
+  require Node on the host.
+- **Google Chrome** (stable channel) — needed only for the MercadoLibre
+  workflow, which attaches to your real Chrome via CDP. See
+  [HOW_TO_SCRAP_ML.md](HOW_TO_SCRAP_ML.md).
+- **Anthropic account** — for the Claude-agent scrapers (Zonaprop, Remax).
+  Free-tier is enough for casual use.
 
 ### Authenticating the Claude CLI (one-time setup)
 
-The agent-based scrapers (Zonaprop, Remax, MercadoLibre) spawn `claude`
-subprocesses inside the container. The container needs to reach the Anthropic
-API on your behalf. Pick whichever auth path matches your host:
+The agent-based scrapers (Zonaprop, Remax) spawn `claude` subprocesses
+inside the container. The container needs to reach the Anthropic API on
+your behalf. Pick whichever auth path matches your host:
 
 - **Linux host** with `claude login` already run: the compose file mounts
   `~/.claude` into the container; the file-based credentials are picked up
   automatically.
 - **macOS host** (credentials live in the Keychain, not in a file):
   1. On the host run `claude setup-token` and copy the long-lived OAuth token.
-  2. `cp .env.example .env` and set `CLAUDE_CODE_OAUTH_TOKEN=…`.
+  2. In `.env` set `CLAUDE_CODE_OAUTH_TOKEN=…`.
   3. `docker compose up --build`.
 
-If neither path is configured, the three agent-based scrapers fail with an
+If neither path is configured, the two agent-based scrapers fail with an
 auth error but the ArgenProp scraper continues to work and the rest of the
-pipeline (stats, ranking, UI) functions normally.
+pipeline (stats, ranking, UI, geocoding) functions normally.
+
+### Verifying the setup
+
+Once the container is up, hit these sanity checks:
+
+```bash
+curl -s http://localhost:3000/healthz          # → {"ok":true}
+curl -s http://localhost:3000/api/fx | head    # → { "usd_ars": 1234.5, … }
+curl -s "http://localhost:3000/api/sources?neighborhoods=nunez" | head
+```
+
+Then load the UI, type "núñez" in the barrio search, and click "Analizar".
+If the job runs and stats appear within ~2 minutes, you're wired up.
 
 ## Business rules
 
@@ -43,14 +83,47 @@ pipeline (stats, ranking, UI) functions normally.
 
 ## Sources
 
-| Source       | Status            | How it works                                                                                                                |
-|--------------|--------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| ArgenProp    | ✅ HTTP            | Plain `fetch` + regex over the card markup (`data-item-card`, `card__main-features`, `card__address`). Fast and stable.     |
-| MercadoLibre | 🤖 Claude agent    | Public API now requires OAuth (returns 403). A `claude` CLI subprocess driven by a per-source skill navigates the public listings pages and returns a JSON document. |
-| Remax        | 🤖 Claude agent    | SPA whose internal API changes often. Delegated to a `claude` CLI subprocess + skill so changes don't require code edits.   |
-| Zonaprop    | 🤖 Claude agent    | DataDome blocks plain HTTP. Delegated to a `claude` CLI subprocess + skill.                                                  |
+| Source       | Status                          | How it works                                                                                                                |
+|--------------|---------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| ArgenProp    | ✅ HTTP                         | Plain `fetch` + regex over the card markup (`data-item-card`, `card__main-features`, `card__address`). Fast and stable.     |
+| MercadoLibre | 🔧 Manual CLI ([HOW_TO_SCRAP_ML.md](HOW_TO_SCRAP_ML.md)) | Anti-bot fingerprints any Playwright Chrome. Excluded from the UI; runs only via `scripts/scrape-ml.js` which CDP-attaches to a user-launched Chrome. |
+| Remax        | 🤖 Claude agent                 | SPA whose internal API changes often. Delegated to a `claude` CLI subprocess + skill so changes don't require code edits.   |
+| Zonaprop     | 🤖 Claude agent                 | DataDome blocks plain HTTP. Delegated to a `claude` CLI subprocess + skill.                                                  |
 
 Skill prompts live in `skills/*.md` and can be edited without touching the Node code.
+
+## UI features
+
+- **Saved analyses** — every search you run (barrios + filter combo) gets
+  a stable UUID. Recent ones appear under "Análisis recientes" so you can
+  jump back into an analysis without rebuilding the filters.
+- **Multi-selection with tabs** — click "+ agregar" on any recent analysis
+  to add it to the currently-open selection. Each analysis becomes a tab.
+  - **Ranking + map merge across all selected tabs** (dedup by listing id),
+    so you can compare properties from multiple searches in one view.
+  - **Stats and "Estado por fuente" show the ACTIVE tab only** — click a
+    tab header to switch.
+  - Close a tab with the `×` to remove it from the selection; use "Nuevo
+    análisis" to clear everything.
+  - The whole selection persists in `localStorage` and restores on reload.
+- **Map view** (`Tabla / Mapa` toggle above the ranking) — Leaflet + OSM
+  tiles, no API key. Each property is a price-pill marker coloured by
+  yield: green ≥8%, lime ≥6%, amber ≥5%, gray otherwise. Neighborhood
+  polygons are drawn from `data/caba-barrios.json` (fetched via
+  `scripts/build-caba-barrios.js` from the official GCBA dataset — GBA
+  Norte barrios have no polygon and show markers only).
+  - **Hover** a marker: full listing detail (price, ambientes, m²,
+    yield, address). Compare pins side by side without clicking.
+  - **Click** a marker: opens the listing URL directly in a new tab.
+  - **Already-viewed markers** get a **violet border** (like a browser's
+    visited-link colour) and a `✓` prefix so you can scan a busy map and
+    see which you've already opened without losing the yield-colour
+    signal. Persists in `localStorage`. Clear it via DevTools →
+    Application → Local Storage → key `viewedListings`.
+- **Analysis id + CLI copy buttons** — the "Análisis activo" panel shows
+  the UUID and two buttons: `copiar id` and `copiar comando` (drops
+  `node --env-file=.env scripts/run-analysis.js <id>` into your clipboard,
+  ready to paste in a terminal).
 
 ## Geocoding
 
@@ -170,6 +243,32 @@ data/                  Docker volume (analyzer.db + seeded JSON files)
 - Edit `data/neighborhoods.json` to add neighborhoods or aliases.
 - Edit `skills/*.md` to tune how the Claude-based scrapers navigate each site.
 - Environment variables: `CACHE_TTL_HOURS`, `MAX_CONCURRENCY`, `INCREMENTAL_STOP_AFTER`, `FULL_REFRESH_DAYS`, `LOG_LEVEL`, `GEO_CONCURRENCY` (text-geocoder workers, default 8), `ZONAPROP_MAP_FALLBACK_CONCURRENCY` (parallel Playwright map fallbacks, default 2).
+
+## Running an analysis from the CLI / CI
+
+Every saved analysis has a stable UUID that appears in the UI ("Análisis
+activo" card and the recent-analyses list) with copy buttons. Take that id
+and run:
+
+```
+node --env-file=.env scripts/run-analysis.js <analysis-id>
+```
+
+By default this runs all three phases (**scrape → enrich → geocode**) for
+all four sources, on every barrio in the analysis. Two filters let you
+trim it down to whatever the CI step needs:
+
+| Flag | Meaning |
+|---|---|
+| `--phase=enrich`            | Run only the enrich phase (skip scrape + geocode). Comma-separated subset of `scrape,enrich,geocode`. |
+| `--source=zonaprop`         | Run only this source's pipeline. Comma-separated subset of `zonaprop,argenprop,remax`. |
+| `--skip-scrape` etc.        | Shorthand inverse of `--phase`. |
+| `--force`                   | Bypass the 24h `enrich_attempted_at` cooldown. |
+| `--limit=N`                 | Cap listings per source per barrio (default 10000). |
+
+> MercadoLibre is **not** handled by this script — its anti-bot wall needs
+> CDP-attach to a user-launched Chrome. See [HOW_TO_SCRAP_ML.md](HOW_TO_SCRAP_ML.md)
+> and use `scripts/scrape-ml.js` instead.
 
 ## Security
 

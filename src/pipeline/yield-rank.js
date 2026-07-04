@@ -5,7 +5,8 @@ const SELECT_VENTAS = `
 SELECT id, source, external_id, url, neighborhood, neighborhood_raw, rooms, bedrooms, bathrooms,
        covered_m2, uncovered_m2, total_m2, homogenized_m2, age_years, age_band,
        has_pool, has_amenities, has_garage, floor, amenities_json,
-       price, currency, price_usd, status, delivery_year, sub_zone
+       price, currency, price_usd, status, delivery_year, sub_zone,
+       lat, lng, address
 FROM listings
 WHERE operation = 'venta' AND neighborhood IN ({{ph}}) AND active = 1
   AND price_usd > 0 AND homogenized_m2 > 0
@@ -127,6 +128,12 @@ export function rankProperties({
       ref_usd_per_m2: round2(ref_usd_per_m2),
       build_ref_source,
       score: round4(score),
+      // Geo fields — needed by the map view in the UI. SELECT pulls them in;
+      // forwarding to the API response so the markers can be plotted.
+      lat: r.lat,
+      lng: r.lng,
+      address: r.address,
+      sub_zone: r.sub_zone,
     });
   }
 

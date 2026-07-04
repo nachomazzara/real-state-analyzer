@@ -27,6 +27,41 @@ async function getPersistentContext() {
   // launchPersistentContext, racing on the SingletonLock symlink — the
   // second loses with "File exists (17)" and the scrape errors out.
   if (launching) return launching;
+  // CDP attach path — when CHROME_CDP_URL is set, connect to a Chrome the
+  // user already has open (started with --remote-debugging-port=9222).
+  // This bypasses Playwright's launch flow entirely, which means we
+  // inherit the user's logged-in session, organic cookies, browsing
+  // history fingerprint, etc. The single most effective anti-detection
+  // trick: don't run a fresh browser, ride the human's.
+  const cdpUrl = process.env.CHROME_CDP_URL;
+  if (cdpUrl) {
+    launching = (async () => {
+      logger.info({ cdpUrl }, 'connecting to existing Chrome via CDP');
+      const browser = await chromium.connectOverCDP(cdpUrl);
+      // The first context is the user's default — it carries their cookies,
+      // storage, browsing history, and crucially the organic browser
+      // fingerprint that ML's anti-bot trusts. We do NOT install request
+      // routing or anti-detection init scripts here: doing so would disrupt
+      // the user's normal browsing AND undo the very thing that makes this
+      // path effective (looking like a real human session, not a tweaked
+      // automation one). We also do NOT call loadManualCookies — the live
+      // browser already has the right cookies; overwriting from ml-cookies.txt
+      // would corrupt the session.
+      const ctxs = browser.contexts();
+      if (ctxs.length === 0) {
+        throw new Error(`CDP attach: no contexts found at ${cdpUrl} — is the Chrome window open?`);
+      }
+      persistentCtx = ctxs[0];
+      logger.info({ pages: persistentCtx.pages().length }, 'CDP attach OK — reusing user session');
+      return persistentCtx;
+    })();
+    try {
+      return await launching;
+    } catch (err) {
+      launching = null;
+      throw err;
+    }
+  }
   launching = (async () => {
     // Persistent profile across runs. We used to wipe it on each cold start
     // (clean slate, no recovery dialogs) but that made ML's bot detector
@@ -290,7 +325,12 @@ async function loadManualCookies(ctx) {
 
 export async function closeBrowser() {
   if (persistentCtx) {
-    await persistentCtx.close().catch(() => {});
+    // In CDP-attach mode, do NOT call .close() — that would close the user's
+    // own Chrome window. Just drop the reference; the user controls their
+    // browser's lifetime.
+    if (!process.env.CHROME_CDP_URL) {
+      await persistentCtx.close().catch(() => {});
+    }
     persistentCtx = null;
   }
 }

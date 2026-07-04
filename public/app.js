@@ -53,10 +53,124 @@ const state = {
     amenities: [], // empty = all (values: 'pool', 'garage')
     sortBy: 'score',
     sortDir: 'desc',
+    mode: 'table', // 'table' | 'map' — toggle in ranking section
   },
   refreshJobs: {}, // key = source|n|op → { jobId, pollHandle }
-  analysis: null, // currently-loaded analysis object
+  // Multi-analysis selection. `analyses` is the ordered list of analyses
+  // the user has selected. `activeAnalysisId` is the one currently shown in
+  // per-analysis blocks (stats + sources) — switched via the tab bar. The
+  // ranking table + map merge across ALL selected analyses, so this picker
+  // only affects the per-analysis cards.
+  // `analysis` is kept as an alias to the active one so the dozens of
+  // `state.analysis?.id` reads scattered around the file don't need
+  // touching — setActiveAnalysis() keeps them in sync.
+  analyses: [], // selected analyses (full objects), ordered by add time
+  activeAnalysisId: null,
+  analysis: null, // = analyses.find(a => a.id === activeAnalysisId), or null
+  map: null, // Leaflet map instance (lazy-init when user opens the tab)
+  mapLayers: { markers: null, polygons: null }, // layer groups we add/clear per render
+  // Listings the user has clicked "Ver listing" on. Persisted in localStorage
+  // so they survive reloads. Used to render those markers (and table rows)
+  // greyed out, so the user can tell at a glance which they've already
+  // opened. Stored as Set<number> in memory; serialized to a plain array.
+  viewedListings: (() => {
+    try {
+      const raw = localStorage.getItem('viewedListings');
+      const arr = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch { return new Set(); }
+  })(),
 };
+
+// =====================================================================
+// Multi-analysis selection helpers.
+// =====================================================================
+//
+// We persist just the IDs in localStorage; the full objects are re-fetched
+// on page load via /api/analyses/:id (one request per id, in parallel).
+// Active id is also persisted so the user lands on the same tab they left.
+const SELECTION_LS_KEY = 'analysisSelection';
+
+function persistSelection() {
+  try {
+    localStorage.setItem(
+      SELECTION_LS_KEY,
+      JSON.stringify({
+        ids: state.analyses.map((a) => a.id),
+        activeId: state.activeAnalysisId,
+      }),
+    );
+  } catch { /* private mode / quota — ignore */ }
+}
+
+// Switch which selected analysis the per-analysis blocks (stats + sources)
+// render for. Keeps `state.analysis` pointing at the active one so old code
+// that reads `state.analysis?.id` keeps working. Re-renders the tabs +
+// per-analysis blocks. Does NOT re-fetch the ranking/map (those are merged
+// across all selected, independent of which tab is active).
+function setActiveAnalysis(id) {
+  state.activeAnalysisId = id;
+  state.analysis = state.analyses.find((a) => a.id === id) || null;
+  persistSelection();
+  setAnalysisIdInUrl(id);
+  renderCurrentAnalysisBar();
+  // Per-analysis blocks (stats + "estado por fuente") re-render for the
+  // newly active tab. Ranking + map already span all selected so they're
+  // untouched.
+  const aid = state.activeAnalysisId;
+  if (aid) {
+    renderStats(aid).catch((e) => console.warn('renderStats failed', e));
+    loadSources(aid).catch((e) => console.warn('loadSources failed', e));
+  }
+}
+
+// Add a fully-loaded analysis object to the selection. If it's already
+// selected, just switch to it. Triggers re-fetch of the merged ranking/map
+// because the universe of properties changed.
+async function addAnalysisToSelection(analysis, { makeActive = true } = {}) {
+  if (!state.analyses.some((a) => a.id === analysis.id)) {
+    state.analyses.push(analysis);
+  }
+  if (makeActive) setActiveAnalysis(analysis.id);
+  else { renderCurrentAnalysisBar(); persistSelection(); }
+  await loadRanking();
+}
+
+// Drop one analysis from the selection. Picks another as active if the
+// removed one was active. If the selection becomes empty, falls back to
+// the legacy "no analysis selected" state.
+async function removeAnalysisFromSelection(id) {
+  state.analyses = state.analyses.filter((a) => a.id !== id);
+  if (state.activeAnalysisId === id) {
+    const next = state.analyses[0]?.id || null;
+    setActiveAnalysis(next);
+  }
+  persistSelection();
+  renderCurrentAnalysisBar();
+  if (state.analyses.length === 0) {
+    state.rankingItems = [];
+    state.analysis = null;
+    state.activeAnalysisId = null;
+    setAnalysisIdInUrl(null);
+    $('#ranking-section').classList.add('hidden');
+    $('#stats-section').classList.add('hidden');
+    $('#sources-section').classList.add('hidden');
+    return;
+  }
+  await loadRanking();
+}
+
+// Track that the user opened a listing's URL. Updates the in-memory Set
+// and persists. Caller is responsible for re-rendering whatever shows the
+// viewed state.
+function markListingViewed(id) {
+  if (id == null || state.viewedListings.has(id)) return false;
+  state.viewedListings.add(id);
+  try {
+    localStorage.setItem('viewedListings', JSON.stringify([...state.viewedListings]));
+  } catch { /* localStorage full / private mode — ignore */ }
+  return true;
+}
 
 function persistSession() {
   try {
@@ -303,8 +417,16 @@ $('#analyze').addEventListener('click', async () => {
     });
     if (!r.ok) throw new Error('create analysis failed: ' + r.status);
     const analysis = await r.json();
+    // Add to the multi-selection rather than replacing. If the user already
+    // had other analyses open, the new one shows up as a new tab and
+    // becomes active.
+    if (!state.analyses.some((a) => a.id === analysis.id)) {
+      state.analyses.push(analysis);
+    }
+    state.activeAnalysisId = analysis.id;
     state.analysis = analysis;
     setAnalysisIdInUrl(analysis.id);
+    persistSelection();
     renderCurrentAnalysisBar();
 
     // Trigger a scrape for this analysis. force=true on first creation? No —
@@ -354,10 +476,16 @@ $('#refresh-analysis')?.addEventListener('click', async () => {
 });
 
 $('#new-analysis')?.addEventListener('click', () => {
+  // "Nuevo análisis" clears the WHOLE multi-selection, not just one tab.
+  // (To drop a single analysis without losing the others, the user clicks
+  // the × on its tab.)
+  state.analyses = [];
+  state.activeAnalysisId = null;
   state.analysis = null;
   state.neighborhoods = [];
   state.rankingItems = [];
   state.jobId = null;
+  persistSelection();
   setAnalysisIdInUrl(null);
   applyFiltersToForm({});
   renderChips();
@@ -411,7 +539,48 @@ async function pollJob() {
 }
 
 async function restoreSession() {
-  // Priority 1: URL has ?a=<analysis_id> → load that analysis.
+  // Priority 1: multi-selection persisted from the previous session.
+  // Read both lists + active id, fetch each analysis in parallel, and
+  // restore the tabs in their original order. If any id 404s (was deleted
+  // server-side), we just skip it and continue with the rest.
+  let restoredFromSelection = false;
+  try {
+    const raw = localStorage.getItem(SELECTION_LS_KEY);
+    if (raw) {
+      const sel = JSON.parse(raw);
+      const ids = Array.isArray(sel?.ids) ? sel.ids.filter(Boolean) : [];
+      if (ids.length) {
+        const fetched = await Promise.all(
+          ids.map((id) =>
+            fetch('/api/analyses/' + encodeURIComponent(id))
+              .then((r) => (r.ok ? r.json() : null))
+              .catch(() => null),
+          ),
+        );
+        const valid = fetched.filter(Boolean);
+        if (valid.length) {
+          state.analyses = valid;
+          state.activeAnalysisId = sel.activeId && valid.some((a) => a.id === sel.activeId)
+            ? sel.activeId
+            : valid[0].id;
+          state.analysis = valid.find((a) => a.id === state.activeAnalysisId);
+          state.neighborhoods = [...state.analysis.neighborhoods];
+          applyFiltersToForm(state.analysis.filters);
+          renderChips();
+          renderCurrentAnalysisBar();
+          setAnalysisIdInUrl(state.activeAnalysisId);
+          await loadResults();
+          await loadRecentAnalyses();
+          restoredFromSelection = true;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('could not restore multi-selection', e);
+  }
+  if (restoredFromSelection) return;
+
+  // Priority 2: URL has ?a=<analysis_id> → load that analysis (single).
   const urlAid = getAnalysisIdFromUrl();
   if (urlAid) {
     try {
@@ -419,13 +588,15 @@ async function restoreSession() {
       if (r.ok) {
         const analysis = await r.json();
         await loadAnalysisIntoUI(analysis);
+        await loadResults();
+        await loadRecentAnalyses();
         return;
       }
     } catch (e) {
       console.warn('could not load analysis from URL', e);
     }
   }
-  // Priority 2: localStorage from previous session.
+  // Priority 3: legacy single-analysis snapshot from localStorage.
   const snapshot = readSession();
   if (snapshot?.analysisId) {
     try {
@@ -433,6 +604,8 @@ async function restoreSession() {
       if (r.ok) {
         const analysis = await r.json();
         await loadAnalysisIntoUI(analysis);
+        await loadResults();
+        await loadRecentAnalyses();
         return;
       }
     } catch {
@@ -443,7 +616,15 @@ async function restoreSession() {
   await loadRecentAnalyses();
 }
 
+// Adds the given analysis to the selection (if not already there) and makes
+// it the active tab. The ranking + map re-fetch and merge across all
+// selected. The "neighborhoods chips" / filters form reflect the active
+// tab's setup so the user knows what created the active block.
 async function loadAnalysisIntoUI(analysis) {
+  if (!state.analyses.some((a) => a.id === analysis.id)) {
+    state.analyses.push(analysis);
+  }
+  state.activeAnalysisId = analysis.id;
   state.analysis = analysis;
   state.neighborhoods = [...analysis.neighborhoods];
   applyFiltersToForm(analysis.filters);
@@ -451,6 +632,7 @@ async function loadAnalysisIntoUI(analysis) {
   renderCurrentAnalysisBar();
   setAnalysisIdInUrl(analysis.id);
   persistSession();
+  persistSelection();
 
   // Bump view count on the server.
   fetch(`/api/analyses/${analysis.id}/view`, { method: 'POST' }).catch(() => {});
@@ -480,8 +662,7 @@ async function loadAnalysisIntoUI(analysis) {
 
 function renderCurrentAnalysisBar() {
   const bar = $('#analysis-current');
-  const a = state.analysis;
-  if (!a) {
+  if (!state.analyses.length) {
     bar.classList.add('hidden');
     $('#refresh-analysis').classList.add('hidden');
     $('#new-analysis').classList.add('hidden');
@@ -490,17 +671,79 @@ function renderCurrentAnalysisBar() {
   bar.classList.remove('hidden');
   $('#refresh-analysis').classList.remove('hidden');
   $('#new-analysis').classList.remove('hidden');
-  const pillFilters = [];
-  const f = a.filters;
-  if (f.min_rooms || f.max_rooms) pillFilters.push(`${f.min_rooms ?? '?'}-${f.max_rooms ?? '?'} amb`);
-  if (f.require_pool) pillFilters.push('🏊');
-  if (f.require_garage) pillFilters.push('🚗');
-  if (f.include_pozo) pillFilters.push('+ pozo');
-  if (f.include_construccion) pillFilters.push('+ obra');
-  if (f.min_yield) pillFilters.push(`yield≥${(f.min_yield * 100).toFixed(1)}%`);
-  bar.innerHTML = `<b>Análisis activo:</b> ${a.neighborhoods.join(', ')}
-    ${pillFilters.length ? '· filtros: ' + pillFilters.join(' · ') : '· sin filtros adicionales'}
-    <code>${a.id.slice(0, 8)}</code>`;
+
+  // Tab strip: one tab per selected analysis. Active tab is highlighted;
+  // clicking another tab switches the per-analysis blocks (stats + sources)
+  // to that analysis. The ranking + map below merge across ALL tabs.
+  const tabs = state.analyses
+    .map((a) => {
+      const active = a.id === state.activeAnalysisId ? ' active' : '';
+      const label = escapeHtml(a.neighborhoods.join(', '));
+      return `<button class="analysis-tab${active}" data-id="${a.id}" title="${escapeHtml(a.label || '')}">
+        <span class="analysis-tab-label">${label}</span>
+        <span class="analysis-tab-close" data-close="${a.id}" title="Quitar de la selección">×</span>
+      </button>`;
+    })
+    .join('');
+  const merged = state.analyses.length > 1
+    ? `<div class="analysis-merged-note">Ranking + mapa muestran las ${state.analyses.length} búsquedas combinadas. Las cards de estadísticas / fuentes son del tab activo.</div>`
+    : '';
+
+  // Filter pills + ID/CLI snippet for the ACTIVE tab.
+  const a = state.analysis;
+  let activeBlock = '';
+  if (a) {
+    const pillFilters = [];
+    const f = a.filters || {};
+    if (f.min_rooms || f.max_rooms) pillFilters.push(`${f.min_rooms ?? '?'}-${f.max_rooms ?? '?'} amb`);
+    if (f.require_pool) pillFilters.push('🏊');
+    if (f.require_garage) pillFilters.push('🚗');
+    if (f.include_pozo) pillFilters.push('+ pozo');
+    if (f.include_construccion) pillFilters.push('+ obra');
+    if (f.min_yield) pillFilters.push(`yield≥${(f.min_yield * 100).toFixed(1)}%`);
+    activeBlock = `
+      <div class="analysis-active-meta">
+        ${pillFilters.length ? '<span>filtros: ' + pillFilters.join(' · ') + '</span>' : '<span>sin filtros adicionales</span>'}
+      </div>
+      <div class="analysis-id-row">
+        <span class="analysis-id-label">ID:</span>
+        <code class="analysis-id">${a.id}</code>
+        <button class="btn-copy" data-copy="${a.id}" title="Copiar ID">copiar id</button>
+        <button class="btn-copy" data-copy="node --env-file=.env scripts/run-analysis.js ${a.id}" title="Copiar comando CLI">copiar comando</button>
+      </div>`;
+  }
+
+  bar.innerHTML = `
+    <div class="analysis-tabs">${tabs}</div>
+    ${merged}
+    ${activeBlock}
+  `;
+
+  // Wire tab clicks (switch active) and close buttons (remove from
+  // selection). Close handler runs first to avoid the click bubbling into
+  // the parent tab's switch handler.
+  bar.querySelectorAll('.analysis-tab-close').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      removeAnalysisFromSelection(btn.dataset.close);
+    };
+  });
+  bar.querySelectorAll('.analysis-tab').forEach((tab) => {
+    tab.onclick = () => {
+      const id = tab.dataset.id;
+      if (id !== state.activeAnalysisId) setActiveAnalysis(id);
+    };
+  });
+  bar.querySelectorAll('.btn-copy').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const text = b.dataset.copy;
+      navigator.clipboard?.writeText(text);
+      const original = b.textContent;
+      b.textContent = '✓ copiado';
+      setTimeout(() => { b.textContent = original; }, 1200);
+    };
+  });
 }
 
 async function loadRecentAnalyses() {
@@ -525,29 +768,54 @@ async function loadRecentAnalyses() {
         if (f.include_pozo) pillFilters.push('+ pozo');
         if (f.include_construccion) pillFilters.push('+ obra');
         if (f.min_yield) pillFilters.push(`yield≥${(f.min_yield * 100).toFixed(1)}%`);
-        const isCurrent = state.analysis?.id === a.id ? ' style="border-color:var(--accent)"' : '';
-        return `<div class="analysis-card" data-id="${a.id}"${isCurrent}>
+        const isSelected = state.analyses.some((x) => x.id === a.id);
+        const cls = isSelected ? ' analysis-card-selected' : '';
+        const button = isSelected
+          ? `<button class="btn-refresh" data-action="activate">activar →</button>`
+          : `<button class="btn-refresh" data-action="add">+ agregar</button>`;
+        return `<div class="analysis-card${cls}" data-id="${a.id}">
           <div>
             <div class="label">${a.neighborhoods.join(', ')}
               ${pillFilters.map((p) => `<span class="pill">${p}</span>`).join('')}
             </div>
-            <div class="meta">${relativeTime(a.last_viewed_at)} · visto ${a.view_count}× · <code>${a.id.slice(0, 8)}</code></div>
+            <div class="meta">${relativeTime(a.last_viewed_at)} · visto ${a.view_count}× ·
+              <code class="analysis-id-small">${a.id}</code>
+              <button class="btn-copy-small" data-copy="${a.id}" title="Copiar ID">copiar</button>
+            </div>
           </div>
-          <button class="btn-refresh">abrir →</button>
+          ${button}
         </div>`;
       })
       .join('');
+    // Copy buttons inside the card meta row — must intercept the click so it
+    // doesn't bubble up to the card and open the analysis.
+    c.querySelectorAll('.btn-copy-small').forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        navigator.clipboard?.writeText(b.dataset.copy);
+        const original = b.textContent;
+        b.textContent = '✓';
+        setTimeout(() => { b.textContent = original; }, 1200);
+      };
+    });
     c.querySelectorAll('.analysis-card').forEach((card) => {
       card.onclick = async () => {
         const id = card.dataset.id;
+        // If already in selection, just switch to that tab — don't re-fetch.
+        if (state.analyses.some((a) => a.id === id)) {
+          setActiveAnalysis(id);
+          return;
+        }
         try {
           const r = await fetch('/api/analyses/' + encodeURIComponent(id));
           if (!r.ok) return;
           const analysis = await r.json();
-          // Reset transient state
+          // ADD to selection (don't replace) and make it the active tab.
+          // Then refresh the merged ranking + per-analysis stats.
           state.jobId = null;
-          state.rankingItems = [];
           await loadAnalysisIntoUI(analysis);
+          await loadResults();
+          await loadRecentAnalyses();
         } catch (e) {
           console.warn('could not open analysis', e);
         }
@@ -1571,7 +1839,9 @@ function renderAgeMatrix(matrix, opts = {}) {
   // values (e.g., monthly rent in USD). When omitted we use the original
   // "USD/m² (homogeneizado)" framing.
   const captionDefault = 'Mediana USD/m² (homogeneizado) cruzando antigüedad × cantidad de ambientes. <code>n</code> = total. Abajo, cuántas por fuente (AP=ArgenProp · ZP=Zonaprop · ML=MercadoLibre · RM=Remax). Celdas con <code>—</code> tienen menos de 3 muestras.';
-  let html = '<div class="matrix">';
+  // Drive the grid column count from the bucket array so 9-wide size
+  // matrices don't wrap into the 5-column CSS default.
+  let html = `<div class="matrix" style="--matrix-cols:${buckets.length}">`;
   // Header row: one empty corner cell + N column headers.
   html +=
     '<div class="head"></div>' +
@@ -1622,15 +1892,31 @@ function renderAggregate(a) {
 }
 
 async function loadRanking() {
-  // When the page is bound to an analysis, the backend resolves filters from
-  // the analysis itself. The form inputs are just a visual reflection of
-  // those filters (read-only for an existing analysis — to change them the
-  // user creates a new analysis via Analizar).
-  let url;
-  if (state.analysis?.id) {
-    url = '/api/properties?analysis_id=' + encodeURIComponent(state.analysis.id);
+  // Multi-analysis: fetch one /api/properties per selected analysis in
+  // parallel, then concatenate and dedupe by listing id. Each analysis has
+  // its own filter set, so a property might appear in some but not others —
+  // we want the UNION (the user "selected" all of them).
+  let items = [];
+  if (state.analyses.length > 0) {
+    const responses = await Promise.all(
+      state.analyses.map((a) =>
+        fetch('/api/properties?analysis_id=' + encodeURIComponent(a.id))
+          .then((r) => r.ok ? r.json() : { items: [] })
+          .catch(() => ({ items: [] })),
+      ),
+    );
+    const seen = new Set();
+    for (const data of responses) {
+      for (const it of (data.items || [])) {
+        if (seen.has(it.id)) continue;
+        seen.add(it.id);
+        items.push(it);
+      }
+    }
   } else {
-    // Legacy fallback (no analysis selected yet).
+    // Legacy fallback (no analysis selected yet): build the query from the
+    // raw form inputs. Same payload as before so the path is unchanged when
+    // the user hasn't created an analysis.
     const params = new URLSearchParams({
       neighborhoods: state.neighborhoods.join(','),
       include_pozo: String($('#include-pozo').checked),
@@ -1644,12 +1930,11 @@ async function loadRanking() {
     if (minRooms) params.set('min_rooms', minRooms);
     const maxRooms = $('#max-rooms').value;
     if (maxRooms) params.set('max_rooms', maxRooms);
-    url = '/api/properties?' + params.toString();
+    const r = await fetch('/api/properties?' + params.toString());
+    const data = await r.json();
+    items = Array.isArray(data.items) ? data.items : [];
   }
-
-  const r = await fetch(url);
-  const data = await r.json();
-  state.rankingItems = Array.isArray(data.items) ? data.items : [];
+  state.rankingItems = items;
   $('#ranking-section').classList.remove('hidden');
   renderRankingToolbar();
   renderRankingTable();
@@ -1976,3 +2261,204 @@ function onRankingFilterChange() {
 restoreRankingView();
 loadFx();
 loadNeighborhoods().then(() => restoreSession());
+
+// =====================================================================
+// Map view (Tabla / Mapa toggle in the ranking section).
+// =====================================================================
+
+// Toggle handler: switch the visible container, lazy-init the Leaflet map
+// the first time the user opens the map tab.
+function bindRankingViewToggle() {
+  const buttons = document.querySelectorAll('#ranking-view-toggle .view-tab');
+  buttons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const view = btn.dataset.view;
+      if (view === state.rankingView.mode) return;
+      state.rankingView.mode = view;
+      buttons.forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+      $('#ranking-container').classList.toggle('hidden', view !== 'table');
+      $('#ranking-map').classList.toggle('hidden', view !== 'map');
+      if (view === 'map') renderRankingMap();
+    });
+  });
+}
+bindRankingViewToggle();
+
+// Color for the price-pill marker, scaled by score (or yield). Green for
+// strong returns, gray for weak. Anchored on rental yield when present,
+// build yield otherwise.
+function markerColor(it) {
+  const y = it.rental_yield_pct ?? it.build_yield_pct;
+  if (y == null) return '#94a3b8';      // slate-400
+  if (y >= 0.08) return '#16a34a';      // green-600
+  if (y >= 0.06) return '#65a30d';      // lime-600
+  if (y >= 0.05) return '#ca8a04';      // yellow-600
+  return '#94a3b8';
+}
+
+// Format the price for the marker label: "USD 180k" / "USD 1.2M".
+function fmtPriceShort(usd) {
+  if (usd == null || !Number.isFinite(usd)) return '—';
+  if (usd >= 1_000_000) return `USD ${(usd / 1_000_000).toFixed(1)}M`;
+  return `USD ${Math.round(usd / 1000)}k`;
+}
+
+// Cache for boundary GeoJSON keyed by neighborhood id. The endpoint 404s
+// for non-CABA barrios (Vicente López, etc); we cache the miss so we
+// don't refetch on every render.
+const boundaryCache = new Map();
+async function loadBoundary(id) {
+  if (boundaryCache.has(id)) return boundaryCache.get(id);
+  try {
+    const r = await fetch(`/api/neighborhoods/${encodeURIComponent(id)}/boundary`);
+    if (!r.ok) {
+      boundaryCache.set(id, null);
+      return null;
+    }
+    const j = await r.json();
+    boundaryCache.set(id, j);
+    return j;
+  } catch {
+    boundaryCache.set(id, null);
+    return null;
+  }
+}
+
+// Render or refresh the Leaflet map. Lazy-initializes the map instance on
+// first call; subsequent calls reuse it (just clear and repaint layers).
+async function renderRankingMap() {
+  if (typeof L === 'undefined') return; // Leaflet not loaded yet (CDN failed?)
+  const el = $('#ranking-map');
+  if (!el) return;
+
+  // Lazy-init the Leaflet map. Tile provider: OSM standard (free, no key).
+  if (!state.map) {
+    // Default center: CABA centro (will recenter once we have data).
+    state.map = L.map(el, { zoomControl: true, attributionControl: true })
+      .setView([-34.605, -58.435], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap',
+    }).addTo(state.map);
+    state.mapLayers.markers = L.layerGroup().addTo(state.map);
+    state.mapLayers.polygons = L.layerGroup().addTo(state.map);
+  } else {
+    // Leaflet needs invalidateSize() after the container went from hidden
+    // to visible — otherwise tiles render at 0×0.
+    setTimeout(() => state.map.invalidateSize(), 50);
+  }
+
+  // Clear previous render.
+  state.mapLayers.markers.clearLayers();
+  state.mapLayers.polygons.clearLayers();
+
+  // Polygons: one per selected neighborhood, when available.
+  const neighborhoods = state.analysis?.neighborhoods || state.neighborhoods || [];
+  const polygonBounds = [];
+  for (const nid of neighborhoods) {
+    const b = await loadBoundary(nid);
+    if (!b?.geometry) continue;
+    const layer = L.geoJSON(b.geometry, {
+      style: {
+        color: '#475569',     // slate-600 outline
+        weight: 2,
+        fillColor: '#475569',
+        fillOpacity: 0.08,
+      },
+    }).addTo(state.mapLayers.polygons);
+    layer.bindTooltip(b.display, { sticky: true, direction: 'top' });
+    polygonBounds.push(layer.getBounds());
+  }
+
+  // Markers: each property with lat/lng gets a price-label pill.
+  const items = applyRankingView(state.rankingItems).filter(
+    (it) => Number.isFinite(it.lat) && Number.isFinite(it.lng),
+  );
+  const markerBounds = [];
+
+  // Build the marker's DivIcon. Extracted so the popup's "mark viewed"
+  // click can rebuild it without duplicating the HTML template.
+  //
+  // Sizing: `iconSize` + `iconAnchor` are REQUIRED for Leaflet to know
+  // where clicks land. With `iconSize: null` the click hitbox collapses
+  // to a point and the visible pill (CSS-translated up-left) becomes
+  // effectively unclickable. We approximate the pill's rendered size from
+  // the label length — good enough for click detection since browsers
+  // fuzz the target a few px anyway. Anchor is the pill's BOTTOM-CENTER
+  // so the exact lat/lng sits right under the tail of the label.
+  function buildMarkerIcon(it) {
+    const color = markerColor(it);
+    const label = fmtPriceShort(it.price_usd);
+    const viewedCls = state.viewedListings.has(it.id) ? ' viewed' : '';
+    const prefix = viewedCls ? '✓ ' : '';
+    const text = prefix + label;
+    // Rough pill dims: ~7px/char at 12px font-weight-600 tabular, plus
+    // horizontal padding (16). Height is fixed by the CSS pill.
+    const w = Math.max(56, Math.round(text.length * 7 + 16));
+    const h = 22;
+    return L.divIcon({
+      className: 'price-marker',
+      html: `<span class="price-marker-pill${viewedCls}" style="background:${color}">${text}</span>`,
+      iconSize: [w, h],
+      iconAnchor: [w / 2, h], // bottom-center of the pill sits on the coord
+    });
+  }
+
+  for (const it of items) {
+    const label = fmtPriceShort(it.price_usd);
+    const m = L.marker([it.lat, it.lng], { icon: buildMarkerIcon(it) });
+    const yieldText =
+      it.rental_yield_pct != null
+        ? `${(it.rental_yield_pct * 100).toFixed(1)}% alq`
+        : it.build_yield_pct != null
+          ? `${(it.build_yield_pct * 100).toFixed(1)}% build`
+          : '—';
+    // Hover tooltip — carries the full listing detail (price, dims, yield,
+    // address) so the user doesn't have to click to compare pins side by
+    // side. Click on the marker opens the listing URL directly (see below).
+    const addr = escapeHtml(it.address || it.neighborhood_raw || '');
+    const tooltipHtml = `
+      <div class="map-hover-price">${escapeHtml(label)}</div>
+      <div class="map-hover-line">${it.rooms ?? '?'} amb · ${it.homogenized_m2 ?? '?'} m² · ${yieldText}</div>
+      ${addr ? `<div class="map-hover-addr">${addr}</div>` : ''}
+      <div class="map-hover-hint">click para abrir el listing ↗</div>
+    `;
+    m.bindTooltip(tooltipHtml, {
+      direction: 'top',
+      offset: [0, -6],
+      sticky: false,
+      className: 'map-hover-tip',
+    });
+    // Click opens the listing URL directly in a new tab (window.open is
+    // safer than a synthetic <a>.click() because it inherits the "noopener"
+    // rel behavior via the 'noopener' feature string, and Leaflet's own
+    // click handling doesn't stomp on it). Marking-as-viewed happens in
+    // the same handler so the marker's style updates immediately.
+    m.on('click', () => {
+      if (!it.url) return;
+      window.open(it.url, '_blank', 'noopener,noreferrer');
+      if (markListingViewed(it.id)) {
+        m.setIcon(buildMarkerIcon(it));
+      }
+    });
+    m.addTo(state.mapLayers.markers);
+    markerBounds.push([it.lat, it.lng]);
+  }
+
+  // Fit to whatever we have: polygons union if present, otherwise markers.
+  if (polygonBounds.length) {
+    let merged = polygonBounds[0];
+    for (let i = 1; i < polygonBounds.length; i++) merged = merged.extend(polygonBounds[i]);
+    state.map.fitBounds(merged, { padding: [20, 20] });
+  } else if (markerBounds.length) {
+    state.map.fitBounds(markerBounds, { padding: [20, 20] });
+  }
+}
+
+// Re-render the map whenever the ranking changes — but only when the user
+// is actually looking at it (no point burning CPU when the table is shown).
+const origRenderRankingTable = renderRankingTable;
+renderRankingTable = function (...args) {
+  origRenderRankingTable.apply(this, args);
+  if (state.rankingView.mode === 'map') renderRankingMap();
+};

@@ -33,6 +33,13 @@ const SCRAPERS = Object.fromEntries(
 
 const OPERATIONS = ['venta', 'alquiler'];
 const SOURCE_NAMES = Object.keys(SCRAPERS);
+// Sources excluded from UI-triggered runs (scrapeNeighborhood + enrich). ML
+// is here because its anti-bot only lets us through when attached via CDP to
+// a user-launched Chrome — see HOW_TO_SCRAP_ML.md. The `scrapeSingleTarget`
+// entrypoint still accepts ML so `scripts/scrape-ml.js` can drive it
+// directly with the right environment.
+const UI_EXCLUDED = new Set(['mercadolibre']);
+const UI_SOURCE_NAMES = SOURCE_NAMES.filter((s) => !UI_EXCLUDED.has(s));
 
 async function scrapeOne({ source, neighborhood, operation, fxRate, mode }) {
   const scraper = SCRAPERS[source];
@@ -147,31 +154,16 @@ export async function scrapeNeighborhood(neighborhood, { onProgress, force = fal
   const fxRate = await getMepRate();
   const limit = pLimit(Math.max(1, config.maxConcurrency));
   const jobs = [];
-  // ML cookies are shared across every ML job in this neighborhood — if they
-  // expire mid-run the first job to notice trips this breaker and the rest
-  // skip immediately instead of repeating the same failed login.
-  let mlAuthBroken = false;
-  for (const source of SOURCE_NAMES) {
+  // ML is intentionally NOT iterated here — it lives in `scripts/scrape-ml.js`
+  // because the UI flow can't satisfy its CDP-attach requirement. Hence
+  // UI_SOURCE_NAMES (no `mercadolibre`) instead of SOURCE_NAMES.
+  for (const source of UI_SOURCE_NAMES) {
     for (const operation of OPERATIONS) {
       const mode = decideMode(source, neighborhood, operation);
       jobs.push(
         limit(async () => {
-          if (source === 'mercadolibre' && mlAuthBroken) {
-            const skipped = { ok: false, source, neighborhood: neighborhood.id, operation, mode, counts: { new: 0, updated: 0, unchanged: 0, skipped: 0, total: 0 }, error: 'skipped: ML auth broken earlier in run' };
-            if (onProgress) onProgress({ ...skipped, status: 'done' });
-            return skipped;
-          }
           if (onProgress) onProgress({ source, neighborhood: neighborhood.id, operation, status: 'starting', mode });
           const result = await scrapeOne({ source, neighborhood, operation, fxRate, mode });
-          if (source === 'mercadolibre' && !result.ok && /MercadoLibreAuthError|cookies likely expired/i.test(result.error || '')) {
-            if (!mlAuthBroken) {
-              mlAuthBroken = true;
-              logger.error(
-                { neighborhood: neighborhood.id, operation },
-                'MercadoLibre auth failed — skipping remaining ML jobs in this neighborhood. Refresh data/ml-cookies.txt and re-run.',
-              );
-            }
-          }
           if (onProgress) onProgress({ ...result, status: 'done' });
           return result;
         }),
